@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Generating Complete Elamal (com.nanomks.elamal) Project ==="
+echo "=== Generating Complete Elamal v3.0.0 (com.nanomks.elamal) Project ==="
 
 mkdir -p app/src/main/java/com/nanomks/elamal/data
 mkdir -p app/src/main/java/com/nanomks/elamal/util
@@ -66,8 +66,8 @@ android {
         applicationId = "com.nanomks.elamal"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "2.0.0"
+        versionCode = 3
+        versionName = "3.0.0"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -167,7 +167,7 @@ cat << 'EOF' > app/src/main/res/xml/file_paths.xml
 </paths>
 EOF
 
-# 6. Adaptive Icons (Default + Alt + Monochrome Layer)
+# 6. Adaptive Icons (Default Green + Alt Royal Blue + Gold + Monochrome Layer)
 cat << 'EOF' > app/src/main/res/drawable/ic_launcher_background.xml
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -321,6 +321,7 @@ cat << 'EOF' > app/src/main/AndroidManifest.xml
                 <action android:name="com.nanomks.elamal.ACTION_WIDGET_CLICK" />
                 <action android:name="com.nanomks.elamal.ACTION_WIDGET_RESET_TAP" />
                 <action android:name="com.nanomks.elamal.ACTION_FORGOT_CLOCK_OUT" />
+                <action android:name="com.nanomks.elamal.ACTION_WIFI_DISCONNECT_TIMEOUT" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
@@ -340,7 +341,7 @@ cat << 'EOF' > app/src/main/AndroidManifest.xml
 </manifest>
 EOF
 
-# 9. Database Entities & DAO
+# 9. Database Entities & DAO (With Idempotent Widget Event Support)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/data/Entities.kt
 package com.nanomks.elamal.data
 
@@ -350,7 +351,7 @@ enum class EntryType {
     HOURLY, REMOTE, CREDIT
 }
 
-@Entity(tableName = "work_entries")
+@Entity(tableName = "work_entries", indices = [Index(value = ["eventUuid"], unique = true)])
 data class WorkEntry(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val type: EntryType,
@@ -361,7 +362,8 @@ data class WorkEntry(
     val calculatedAmount: Double = 0.0,
     val note: String = "",
     val settlementId: Long? = null,
-    val isDeleted: Boolean = false
+    val isDeleted: Boolean = false,
+    val eventUuid: String? = null
 )
 
 @Entity(tableName = "settlements")
@@ -381,7 +383,8 @@ data class WifiSession(
     val ssid: String,
     val startTime: Long,
     val endTime: Long,
-    val status: String = "PENDING" // PENDING, ADDED, IGNORED
+    val status: String = "PENDING", // PENDING, ADDED, IGNORED
+    val isOpen: Boolean = false
 )
 EOF
 
@@ -404,6 +407,9 @@ interface ElamalDao {
     @Query("SELECT * FROM work_entries WHERE isDeleted = 0 ORDER BY startTime DESC")
     suspend fun getAllEntriesSync(): List<WorkEntry>
 
+    @Query("SELECT * FROM work_entries WHERE eventUuid = :uuid LIMIT 1")
+    suspend fun getEntryByUuid(uuid: String): WorkEntry?
+
     @Query("SELECT * FROM settlements ORDER BY timestamp DESC")
     fun getAllSettlements(): Flow<List<Settlement>>
 
@@ -416,7 +422,7 @@ interface ElamalDao {
     @Query("SELECT * FROM wifi_sessions ORDER BY endTime DESC LIMIT 1")
     suspend fun getLatestWifiSessionSync(): WifiSession?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertEntry(entry: WorkEntry): Long
 
     @Update
@@ -471,7 +477,7 @@ interface ElamalDao {
     }
 }
 
-@Database(entities = [WorkEntry::class, Settlement::class, WifiSession::class], version = 2, exportSchema = false)
+@Database(entities = [WorkEntry::class, Settlement::class, WifiSession::class], version = 3, exportSchema = false)
 abstract class ElamalDatabase : RoomDatabase() {
     abstract fun dao(): ElamalDao
 
@@ -492,7 +498,7 @@ abstract class ElamalDatabase : RoomDatabase() {
 }
 EOF
 
-# 10. ElamalUtils: Pay Calculators, Root Wi-Fi Merger (<10m), AES-GCM Encrypt/Decrypt, Alarms
+# 10. ElamalUtils: Widget Queue Sync (8s Retention + Idempotency), Root Wi-Fi 10m Disconnect & Merge Engine, AES-GCM
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/ElamalUtils.kt
 package com.nanomks.elamal.util
 
@@ -505,6 +511,9 @@ import com.nanomks.elamal.data.EntryType
 import com.nanomks.elamal.data.WifiSession
 import com.nanomks.elamal.data.WorkEntry
 import com.nanomks.elamal.widget.ElamalWidgetReceiver
+import kotlinx.coroutines.delay
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.math.BigDecimal
@@ -536,6 +545,10 @@ object ElamalUtils {
         return "${h} س ${m} د"
     }
 
+    /**
+     * Reads connected Wi-Fi SSID via Root (su) without Location/GPS permission.
+     * Tries `cmd wifi status` and falls back to `dumpsys wifi` / `iwgetid`.
+     */
     fun getConnectedSsidViaRoot(): String? {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "cmd wifi status"))
@@ -544,15 +557,17 @@ object ElamalUtils {
             process.waitFor()
             val regex = Regex("""SSID:\s*"([^"]+)"""")
             val match = regex.find(output)
-            match?.groupValues?.getOrNull(1)?.takeIf { it != "<unknown ssid>" }
+            val ssid = match?.groupValues?.getOrNull(1)?.takeIf { it != "<unknown ssid>" }
+            ssid
         } catch (e: Exception) {
             null
         }
     }
 
     /**
-     * Economical Root Wi-Fi session tracker:
-     * Supports up to 6 work SSIDs, merges short disconnects (< 10 mins) and merges switching between work networks (2.4G / 5G).
+     * Economical Root Wi-Fi Session Engine:
+     * - Connection = Start, Disconnection (after 10 minutes) = End.
+     * - Merges short disconnects (< 10 mins) and merges switching between up to 6 work networks (e.g., 2.4GHz & 5GHz).
      */
     suspend fun pollAndMergeRootWifi(context: Context, dao: ElamalDao): String? {
         val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
@@ -564,18 +579,119 @@ object ElamalUtils {
 
         val currentSsid = getConnectedSsidViaRoot()
         val now = System.currentTimeMillis()
+        val isWorkWifi = currentSsid != null && configuredList.any { it.equals(currentSsid, ignoreCase = true) }
 
-        if (currentSsid != null && configuredList.any { it.equals(currentSsid, ignoreCase = true) }) {
-            val latest = dao.getLatestWifiSessionSync()
-            // Merge if last session was PENDING and ended less than 10 minutes ago (even across 2 different work SSIDs!)
-            if (latest != null && latest.status == "PENDING" && (now - latest.endTime) <= 10 * 60_000L) {
-                val mergedName = if (latest.ssid.contains(currentSsid)) latest.ssid else "${latest.ssid}+${currentSsid}"
-                dao.updateWifiSession(latest.copy(ssid = mergedName, endTime = now))
-            } else {
-                dao.insertWifiSession(WifiSession(ssid = currentSsid, startTime = now, endTime = now, status = "PENDING"))
+        val latest = dao.getLatestWifiSessionSync()
+
+        if (isWorkWifi && currentSsid != null) {
+            // Cancel any pending 10-minute disconnect timeout
+            cancelWifiDisconnectTimeout(context)
+
+            if (latest != null && latest.status == "PENDING") {
+                val gapMillis = now - latest.endTime
+                if (latest.isOpen || gapMillis <= 10 * 60_000L) {
+                    // Merge short disconnect (<10m) or dual-band switch between work networks!
+                    val mergedSsid = if (latest.ssid.split("+").any { it.equals(currentSsid, ignoreCase = true) }) {
+                        latest.ssid
+                    } else {
+                        "${latest.ssid}+$currentSsid"
+                    }
+                    dao.updateWifiSession(latest.copy(ssid = mergedSsid, endTime = now, isOpen = true))
+                    return currentSsid
+                }
+            }
+            // Otherwise start a new open work Wi-Fi session
+            dao.insertWifiSession(
+                WifiSession(ssid = currentSsid, startTime = now, endTime = now, status = "PENDING", isOpen = true)
+            )
+        } else {
+            // Disconnected from work Wi-Fi: if there's an open session, close it if >10 mins have passed, or schedule 10m check
+            if (latest != null && latest.isOpen) {
+                if (now - latest.endTime >= 10 * 60_000L) {
+                    dao.updateWifiSession(latest.copy(isOpen = false))
+                } else {
+                    scheduleWifiDisconnectTimeout(context, latest.endTime + 10 * 60_000L)
+                }
             }
         }
         return currentSsid
+    }
+
+    private fun scheduleWifiDisconnectTimeout(context: Context, triggerAtMillis: Long) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, ElamalWidgetReceiver::class.java).apply {
+            action = "com.nanomks.elamal.ACTION_WIFI_DISCONNECT_TIMEOUT"
+        }
+        val pi = PendingIntent.getBroadcast(
+            context, 303, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.set(AlarmManager.RTC, triggerAtMillis, pi)
+    }
+
+    private fun cancelWifiDisconnectTimeout(context: Context) {
+        val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, ElamalWidgetReceiver::class.java).apply {
+            action = "com.nanomks.elamal.ACTION_WIFI_DISCONNECT_TIMEOUT"
+        }
+        val pi = PendingIntent.getBroadcast(
+            context, 303, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.cancel(pi)
+    }
+
+    /**
+     * Widget Event Queue Processor:
+     * - Automatically registers widget completed sessions when the app is opened.
+     * - Idempotent processing via unique `eventUuid`.
+     * - Does NOT clear widget events until 8 seconds AFTER saving to Room database!
+     */
+    suspend fun processPendingWidgetEventsOnAppOpen(context: Context, dao: ElamalDao) {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val queueJson = prefs.getString("widget_event_queue", "[]") ?: "[]"
+        val arr = runCatching { JSONArray(queueJson) }.getOrNull() ?: return
+        if (arr.length() == 0) return
+
+        val savedUuids = mutableListOf<String>()
+        for (i in 0 until arr.length()) {
+            val o = arr.getJSONObject(i)
+            val uuid = o.getString("uuid")
+            val start = o.getLong("startTime")
+            val end = o.getLong("endTime")
+            val rate = o.getDouble("rate")
+            val pay = calculateHourlyPay(start, end, 0, rate)
+
+            // Idempotent check
+            if (dao.getEntryByUuid(uuid) == null) {
+                dao.insertEntry(
+                    WorkEntry(
+                        type = EntryType.HOURLY,
+                        startTime = start,
+                        endTime = end,
+                        hourlyRateAtEntry = rate,
+                        calculatedAmount = pay,
+                        note = "تسجيل تلقائي من الودجت",
+                        eventUuid = uuid
+                    )
+                )
+            }
+            savedUuids.add(uuid)
+        }
+
+        // Wait full 8 seconds after DB save before clearing processed events from widget storage
+        delay(8000L)
+
+        val currentJson = prefs.getString("widget_event_queue", "[]") ?: "[]"
+        val currentArr = runCatching { JSONArray(currentJson) }.getOrNull() ?: JSONArray()
+        val remainingArr = JSONArray()
+        for (i in 0 until currentArr.length()) {
+            val o = currentArr.getJSONObject(i)
+            if (o.getString("uuid") !in savedUuids) {
+                remainingArr.put(o)
+            }
+        }
+        prefs.edit().putString("widget_event_queue", remainingArr.toString()).apply()
     }
 
     fun scheduleForgotClockOutAlarm(context: Context, startMillis: Long) {
@@ -670,7 +786,7 @@ object ElamalUtils {
 }
 EOF
 
-# 11. PDF & CSV Generator (Light/Dark theme support, Colored Summary Cards, Full Grid, Type Badges, Total Row, Creation Footer)
+# 11. Multi-Page PDF & CSV Generator (Light/Dark Mode, Colored Cards, Full Grid, Type Badges, Total Row, Creation Footer)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/PdfReportGenerator.kt
 package com.nanomks.elamal.util
 
@@ -699,9 +815,6 @@ object PdfReportGenerator {
         val doc = PdfDocument()
         val pageWidth = 595
         val pageHeight = 842
-        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
-        val page = doc.startPage(pageInfo)
-        val canvas = page.canvas
 
         val bgColor = if (isDarkMode) Color.parseColor("#0F172A") else Color.parseColor("#FFFFFF")
         val textColor = if (isDarkMode) Color.parseColor("#F8FAFC") else Color.parseColor("#0F172A")
@@ -709,20 +822,10 @@ object PdfReportGenerator {
         val gridColor = if (isDarkMode) Color.parseColor("#334155") else Color.parseColor("#CBD5E1")
         val headerBg = if (isDarkMode) Color.parseColor("#1E293B") else Color.parseColor("#F1F5F9")
 
-        canvas.drawColor(bgColor)
-
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         val dfDateTime = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
         val dfDate = SimpleDateFormat("yyyy-MM-dd", Locale.US)
 
-        // Header Title
-        paint.color = textColor
-        paint.textSize = 20f
-        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        paint.textAlign = Paint.Align.RIGHT
-        canvas.drawText("تقرير «العمل» - $reportTitle", (pageWidth - 36).toFloat(), 48f, paint)
-
-        // Summary Calculations
         var totalHourlyMinutes = 0L
         var totalRemote = 0.0
         var totalCredit = 0.0
@@ -740,72 +843,81 @@ object PdfReportGenerator {
             }
         }
 
-        // 3 Colored Summary Cards
-        val cardTop = 70f
-        val cardBottom = 135f
-        val cardW = 165f
+        val chunks = if (entries.isEmpty()) listOf(emptyList()) else entries.chunked(20)
 
-        // Card 1: Net Total (Green)
-        paint.color = if (isDarkMode) Color.parseColor("#064E3B") else Color.parseColor("#D1FAE5")
-        canvas.drawRoundRect(RectF(pageWidth - 36f - cardW, cardTop, pageWidth - 36f, cardBottom), 10f, 10f, paint)
-        paint.color = if (isDarkMode) Color.parseColor("#34D399") else Color.parseColor("#065F46")
-        paint.textSize = 11f
-        canvas.drawText("الصافي الإجمالي", pageWidth - 48f, cardTop + 24f, paint)
-        paint.textSize = 15f
-        canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), pageWidth - 48f, cardTop + 48f, paint)
+        chunks.forEachIndexed { pageIndex, pageEntries ->
+            val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, pageIndex + 1).create()
+            val page = doc.startPage(pageInfo)
+            val canvas = page.canvas
+            canvas.drawColor(bgColor)
 
-        // Card 2: Total Hours (Blue)
-        val c2Right = pageWidth - 36f - cardW - 14f
-        paint.color = if (isDarkMode) Color.parseColor("#1E3A8A") else Color.parseColor("#DBEAFE")
-        canvas.drawRoundRect(RectF(c2Right - cardW, cardTop, c2Right, cardBottom), 10f, 10f, paint)
-        paint.color = if (isDarkMode) Color.parseColor("#60A5FA") else Color.parseColor("#1E40AF")
-        paint.textSize = 11f
-        canvas.drawText("مجموع الساعات", c2Right - 12f, cardTop + 24f, paint)
-        paint.textSize = 15f
-        canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), c2Right - 12f, cardTop + 48f, paint)
+            // Header Title
+            paint.style = Paint.Style.FILL
+            paint.color = textColor
+            paint.textSize = 19f
+            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            paint.textAlign = Paint.Align.RIGHT
+            canvas.drawText(
+                "تقرير «العمل» - $reportTitle (صفحة ${pageIndex + 1}/${chunks.size})",
+                (pageWidth - 36).toFloat(),
+                46f,
+                paint
+            )
 
-        // Card 3: Credit & Remote (Amber/Red)
-        val c3Right = c2Right - cardW - 14f
-        paint.color = if (isDarkMode) Color.parseColor("#7F1D1D") else Color.parseColor("#FEE2E2")
-        canvas.drawRoundRect(RectF(36f, cardTop, c3Right, cardBottom), 10f, 10f, paint)
-        paint.color = if (isDarkMode) Color.parseColor("#F87171") else Color.parseColor("#991B1B")
-        paint.textSize = 11f
-        canvas.drawText("الكريدي / عن بعد", c3Right - 12f, cardTop + 24f, paint)
-        paint.textSize = 13f
-        canvas.drawText("${String.format(Locale.US, "%.1f", totalCredit)} / +${String.format(Locale.US, "%.1f", totalRemote)}", c3Right - 12f, cardTop + 48f, paint)
+            var y = 68f
+            if (pageIndex == 0) {
+                // Draw 3 Colored Summary Cards on Page 1
+                val cardTop = 65f
+                val cardBottom = 130f
+                val cardW = 165f
 
-        // Table with Full Grid
-        var y = 160f
-        val leftX = 36f
-        val rightX = pageWidth - 36f
-        val rowH = 26f
-        val col1 = rightX - 95f   // Date
-        val col2 = col1 - 80f     // Type Badge
-        val col3 = col2 - 95f     // Duration
-        val col4 = col3 - 150f    // Note (Remaining is Amount)
+                // Card 1: Net Total
+                paint.color = if (isDarkMode) Color.parseColor("#064E3B") else Color.parseColor("#D1FAE5")
+                canvas.drawRoundRect(RectF(pageWidth - 36f - cardW, cardTop, pageWidth - 36f, cardBottom), 10f, 10f, paint)
+                paint.color = if (isDarkMode) Color.parseColor("#34D399") else Color.parseColor("#065F46")
+                paint.textSize = 11f
+                canvas.drawText("الصافي الإجمالي", pageWidth - 48f, cardTop + 24f, paint)
+                paint.textSize = 15f
+                canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), pageWidth - 48f, cardTop + 48f, paint)
 
-        // Table Header Row
-        paint.color = headerBg
-        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
-        paint.color = gridColor
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 1f
-        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+                // Card 2: Total Hours («23 س 58 د»)
+                val c2Right = pageWidth - 36f - cardW - 14f
+                paint.color = if (isDarkMode) Color.parseColor("#1E3A8A") else Color.parseColor("#DBEAFE")
+                canvas.drawRoundRect(RectF(c2Right - cardW, cardTop, c2Right, cardBottom), 10f, 10f, paint)
+                paint.color = if (isDarkMode) Color.parseColor("#60A5FA") else Color.parseColor("#1E40AF")
+                paint.textSize = 11f
+                canvas.drawText("مجموع الساعات", c2Right - 12f, cardTop + 24f, paint)
+                paint.textSize = 15f
+                canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), c2Right - 12f, cardTop + 48f, paint)
 
-        paint.style = Paint.Style.FILL
-        paint.color = textColor
-        paint.textSize = 11f
-        canvas.drawText("التاريخ", rightX - 8f, y + 17f, paint)
-        canvas.drawText("النوع", col1 - 8f, y + 17f, paint)
-        canvas.drawText("المدة", col2 - 8f, y + 17f, paint)
-        canvas.drawText("الملاحظة", col3 - 8f, y + 17f, paint)
-        canvas.drawText("الأجرة", col4 - 8f, y + 17f, paint)
-        y += rowH
+                // Card 3: Credit & Remote
+                val c3Right = c2Right - cardW - 14f
+                paint.color = if (isDarkMode) Color.parseColor("#7F1D1D") else Color.parseColor("#FEE2E2")
+                canvas.drawRoundRect(RectF(36f, cardTop, c3Right, cardBottom), 10f, 10f, paint)
+                paint.color = if (isDarkMode) Color.parseColor("#F87171") else Color.parseColor("#991B1B")
+                paint.textSize = 11f
+                canvas.drawText("الكريدي / عن بعد", c3Right - 12f, cardTop + 24f, paint)
+                paint.textSize = 13f
+                canvas.drawText("${String.format(Locale.US, "%.1f", totalCredit)} / +${String.format(Locale.US, "%.1f", totalRemote)}", c3Right - 12f, cardTop + 48f, paint)
 
-        val maxRows = entries.take(20)
-        for (e in maxRows) {
-            paint.style = Paint.Style.STROKE
+                y = 152f
+            }
+
+            val leftX = 36f
+            val rightX = pageWidth - 36f
+            val rowH = 26f
+            val col1 = rightX - 95f   // Date
+            val col2 = col1 - 80f     // Type Badge
+            val col3 = col2 - 95f     // Duration
+            val col4 = col3 - 150f    // Note
+
+            // Table Header Row
+            paint.style = Paint.Style.FILL
+            paint.color = headerBg
+            canvas.drawRect(leftX, y, rightX, y + rowH, paint)
             paint.color = gridColor
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 1f
             canvas.drawRect(leftX, y, rightX, y + rowH, paint)
             canvas.drawLine(col1, y, col1, y + rowH, paint)
             canvas.drawLine(col2, y, col2, y + rowH, paint)
@@ -814,74 +926,96 @@ object PdfReportGenerator {
 
             paint.style = Paint.Style.FILL
             paint.color = textColor
-            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-            canvas.drawText(dfDate.format(Date(e.startTime)), rightX - 8f, y + 17f, paint)
-
-            // Type Badge
-            val badgeBg = when (e.type) {
-                EntryType.HOURLY -> Color.parseColor("#059669")
-                EntryType.REMOTE -> Color.parseColor("#2563EB")
-                EntryType.CREDIT -> Color.parseColor("#DC2626")
-            }
-            val badgeTxt = when (e.type) {
-                EntryType.HOURLY -> "ساعات"
-                EntryType.REMOTE -> "عن بعد"
-                EntryType.CREDIT -> "كريدي"
-            }
-            paint.color = badgeBg
-            canvas.drawRoundRect(RectF(col2 + 8f, y + 4f, col1 - 8f, y + rowH - 4f), 6f, 6f, paint)
-            paint.color = Color.WHITE
-            paint.textSize = 10f
-            canvas.drawText(badgeTxt, col1 - 14f, y + 17f, paint)
-
-            // Duration formatted «23 س 58 د»
-            paint.color = textColor
-            paint.textSize = 10f
-            val durStr = if (e.type == EntryType.HOURLY && e.endTime != null) {
-                val mins = ((e.endTime - e.startTime) / 60000L) - e.breakMinutes
-                ElamalUtils.formatDurationArabic(mins)
-            } else "-"
-            canvas.drawText(durStr, col2 - 8f, y + 17f, paint)
-
-            // Note
-            canvas.drawText(e.note.take(22), col3 - 8f, y + 17f, paint)
-
-            // Amount
-            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-            paint.color = if (e.calculatedAmount < 0) Color.parseColor("#EF4444") else textColor
-            canvas.drawText(String.format(Locale.US, "%.2f DH", e.calculatedAmount), col4 - 8f, y + 17f, paint)
-
+            paint.textSize = 11f
+            canvas.drawText("التاريخ", rightX - 8f, y + 17f, paint)
+            canvas.drawText("النوع", col1 - 8f, y + 17f, paint)
+            canvas.drawText("المدة", col2 - 8f, y + 17f, paint)
+            canvas.drawText("الملاحظة", col3 - 8f, y + 17f, paint)
+            canvas.drawText("الأجرة", col4 - 8f, y + 17f, paint)
             y += rowH
+
+            for (e in pageEntries) {
+                paint.style = Paint.Style.STROKE
+                paint.color = gridColor
+                canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+                canvas.drawLine(col1, y, col1, y + rowH, paint)
+                canvas.drawLine(col2, y, col2, y + rowH, paint)
+                canvas.drawLine(col3, y, col3, y + rowH, paint)
+                canvas.drawLine(col4, y, col4, y + rowH, paint)
+
+                paint.style = Paint.Style.FILL
+                paint.color = textColor
+                paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+                canvas.drawText(dfDate.format(Date(e.startTime)), rightX - 8f, y + 17f, paint)
+
+                // Type Badge
+                val badgeBg = when (e.type) {
+                    EntryType.HOURLY -> Color.parseColor("#059669")
+                    EntryType.REMOTE -> Color.parseColor("#2563EB")
+                    EntryType.CREDIT -> Color.parseColor("#DC2626")
+                }
+                val badgeTxt = when (e.type) {
+                    EntryType.HOURLY -> "ساعات"
+                    EntryType.REMOTE -> "عن بعد"
+                    EntryType.CREDIT -> "كريدي"
+                }
+                paint.color = badgeBg
+                canvas.drawRoundRect(RectF(col2 + 8f, y + 4f, col1 - 8f, y + rowH - 4f), 6f, 6f, paint)
+                paint.color = Color.WHITE
+                paint.textSize = 10f
+                canvas.drawText(badgeTxt, col1 - 14f, y + 17f, paint)
+
+                // Duration formatted «23 س 58 د»
+                paint.color = textColor
+                paint.textSize = 10f
+                val durStr = if (e.type == EntryType.HOURLY && e.endTime != null) {
+                    val mins = ((e.endTime - e.startTime) / 60000L) - e.breakMinutes
+                    ElamalUtils.formatDurationArabic(mins)
+                } else "-"
+                canvas.drawText(durStr, col2 - 8f, y + 17f, paint)
+
+                // Note
+                canvas.drawText(e.note.take(22), col3 - 8f, y + 17f, paint)
+
+                // Amount
+                paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                paint.color = if (e.calculatedAmount < 0) Color.parseColor("#EF4444") else textColor
+                canvas.drawText(String.format(Locale.US, "%.2f DH", e.calculatedAmount), col4 - 8f, y + 17f, paint)
+
+                y += rowH
+            }
+
+            // Total Summary Row on Last Page
+            if (pageIndex == chunks.lastIndex) {
+                paint.style = Paint.Style.FILL
+                paint.color = headerBg
+                canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+                paint.style = Paint.Style.STROKE
+                paint.color = gridColor
+                canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+
+                paint.style = Paint.Style.FILL
+                paint.color = textColor
+                paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+                paint.textSize = 11f
+                canvas.drawText("المجموع النهائي", rightX - 8f, y + 17f, paint)
+                canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), col2 - 8f, y + 17f, paint)
+                canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), col4 - 8f, y + 17f, paint)
+            }
+
+            // Footer with Creation Date
+            paint.color = subTextColor
+            paint.textSize = 10f
+            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+            canvas.drawText(
+                "تطبيق «العمل» (com.nanomks.elamal) - تاريخ الإنشاء: ${dfDateTime.format(Date())}",
+                rightX,
+                pageHeight - 28f,
+                paint
+            )
+
+            doc.finishPage(page)
         }
-
-        // Total Summary Row at bottom of table
-        paint.style = Paint.Style.FILL
-        paint.color = headerBg
-        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
-        paint.style = Paint.Style.STROKE
-        paint.color = gridColor
-        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
-
-        paint.style = Paint.Style.FILL
-        paint.color = textColor
-        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
-        paint.textSize = 11f
-        canvas.drawText("المجموع النهائي", rightX - 8f, y + 17f, paint)
-        canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), col2 - 8f, y + 17f, paint)
-        canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), col4 - 8f, y + 17f, paint)
-
-        // Footer with Creation Timestamp
-        paint.color = subTextColor
-        paint.textSize = 10f
-        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
-        canvas.drawText(
-            "تطبيق «العمل» (com.nanomks.elamal) - تاريخ الإنشاء: ${dfDateTime.format(Date())}",
-            rightX,
-            pageHeight - 28f,
-            paint
-        )
-
-        doc.finishPage(page)
 
         val reportsDir = File(context.cacheDir, "reports").apply { mkdirs() }
         val pdfFile = File(reportsDir, "Elamal_Report_${System.currentTimeMillis()}.pdf")
@@ -903,7 +1037,6 @@ object PdfReportGenerator {
         val df = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
 
         FileOutputStream(csvFile).use { fos ->
-            // UTF-8 BOM for Arabic Excel support
             fos.write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
             val sb = StringBuilder()
             sb.append("المعرف,النوع,البداية,النهاية,الاستراحة(د),المدة,الأجرة(DH),الملاحظة\n")
@@ -928,7 +1061,7 @@ object PdfReportGenerator {
 }
 EOF
 
-# 12. Smart SAF Backup Manager (5 Safety Rotating Slots ONLY on data loss + Read-back Verify + Pre-restore Backup)
+# 12. Smart SAF Backup Manager
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/BackupSafManager.kt
 package com.nanomks.elamal.util
 
@@ -957,7 +1090,6 @@ object BackupSafManager {
         val settlements = dao.getSettlementsAsc()
         val activeClockIn = prefs.getLong("active_clock_in", 0L)
 
-        // Protection 1: Never overwrite a good backup with an empty dataset
         val prevEntriesCount = prefs.getInt("last_backup_entries_count", 0)
         val prevSettlementsCount = prefs.getInt("last_backup_settlements_count", 0)
         val prevHadClockIn = prefs.getBoolean("last_backup_had_clockin", false)
@@ -966,7 +1098,6 @@ object BackupSafManager {
             return "حماية تلقائية: تم منع الكتابة بنسخة فارغة فوق نسخة تحتوي على بيانات!"
         }
 
-        // Protection 2: 5 Rotating Safety Backups ONLY triggered when data decreases (deleted record, lost clock-in, reduced archive)
         val dataDecreased = (entries.size < prevEntriesCount) ||
                 (settlements.size < prevSettlementsCount) ||
                 (prevHadClockIn && activeClockIn == 0L && entries.size <= prevEntriesCount)
@@ -982,9 +1113,8 @@ object BackupSafManager {
             }
         }
 
-        // Serialize current state to JSON
         val root = JSONObject()
-        root.put("version", 2)
+        root.put("version", 3)
         root.put("timestamp", System.currentTimeMillis())
         root.put("activeClockIn", activeClockIn)
         root.put("hourlyRate", prefs.getFloat("hourly_rate", 10f).toDouble())
@@ -1039,7 +1169,6 @@ object BackupSafManager {
         val writtenUri = writeToDocumentFile(context, dir, targetFileName, finalPayload)
             ?: return "فشل إنشاء ملف النسخة الاحتياطية"
 
-        // Protection 3: Read-back Verification after write
         val verifyRead = readUriText(context, writtenUri)
         if (verifyRead != finalPayload) {
             return "تحذير: فشل التحقق من سلامة الملف بعد الكتابة!"
@@ -1066,7 +1195,6 @@ object BackupSafManager {
         val dir = DocumentFile.fromTreeUri(context, Uri.parse(uriStr)) ?: return "المجلد غير متاح"
         val target = dir.findFile(fileName) ?: return "الملف $fileName غير موجود"
 
-        // Protection: Pre-restore automatic snapshot
         performSmartBackup(context, dao, isManual = true)
 
         val content = readUriText(context, target.uri)
@@ -1146,7 +1274,7 @@ object BackupSafManager {
 }
 EOF
 
-# 13. Widget Receiver (Inexact One-Shot Alarm for 60s Confirmation + Forgot Clock-Out Notification + 8s Idempotency)
+# 13. Widget Receiver (Queues Events with UUID for Auto-Sync on App Open + 8s Retention + Inexact One-Shot Alarm)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/widget/ElamalWidgetReceiver.kt
 package com.nanomks.elamal.widget
 
@@ -1164,12 +1292,13 @@ import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
 import com.nanomks.elamal.R
 import com.nanomks.elamal.data.ElamalDatabase
-import com.nanomks.elamal.data.EntryType
-import com.nanomks.elamal.data.WorkEntry
 import com.nanomks.elamal.util.ElamalUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.UUID
 
 class ElamalWidgetReceiver : AppWidgetProvider() {
 
@@ -1193,13 +1322,19 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
                     showForgotClockOutNotification(context)
                 }
             }
+            "com.nanomks.elamal.ACTION_WIFI_DISCONNECT_TIMEOUT" -> {
+                CoroutineScope(Dispatchers.IO).launch {
+                    val dao = ElamalDatabase.getInstance(context).dao()
+                    ElamalUtils.pollAndMergeRootWifi(context, dao)
+                }
+            }
             "com.nanomks.elamal.ACTION_WIDGET_CLICK" -> {
                 val isEnabled = prefs.getBoolean("widget_enabled", true)
                 if (!isEnabled) return
 
                 val now = System.currentTimeMillis()
                 val lastSave = prefs.getLong("widget_last_save", 0L)
-                if (now - lastSave < 8000L) return // Do not clear/process within 8 seconds of save
+                if (now - lastSave < 8000L) return // 8-second protection after save
 
                 val firstTap = prefs.getLong("widget_first_tap", 0L)
                 if (now - firstTap <= 60_000L) {
@@ -1210,25 +1345,24 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
                         ElamalUtils.scheduleForgotClockOutAlarm(context, now)
                     } else {
                         val rate = prefs.getFloat("hourly_rate", 10f).toDouble()
-                        val pay = ElamalUtils.calculateHourlyPay(activeStart, now, 0, rate)
                         prefs.edit().putLong("active_clock_in", 0L).apply()
                         ElamalUtils.cancelForgotClockOutAlarm(context)
-                        CoroutineScope(Dispatchers.IO).launch {
-                            ElamalDatabase.getInstance(context).dao().insertEntry(
-                                WorkEntry(
-                                    type = EntryType.HOURLY,
-                                    startTime = activeStart,
-                                    endTime = now,
-                                    hourlyRateAtEntry = rate,
-                                    calculatedAmount = pay,
-                                    note = "تسجيل من الودجت"
-                                )
-                            )
+
+                        // Queue event with unique UUID so it is automatically registered when app is opened
+                        // and retained for 8 seconds after DB save!
+                        val queueJson = prefs.getString("widget_event_queue", "[]") ?: "[]"
+                        val arr = runCatching { JSONArray(queueJson) }.getOrDefault(JSONArray())
+                        val ev = JSONObject().apply {
+                            put("uuid", UUID.randomUUID().toString())
+                            put("startTime", activeStart)
+                            put("endTime", now)
+                            put("rate", rate)
                         }
+                        arr.put(ev)
+                        prefs.edit().putString("widget_event_queue", arr.toString()).apply()
                     }
                 } else {
                     prefs.edit().putLong("widget_first_tap", now).apply()
-                    // Schedule One-Shot Inexact Alarm after 60s to reset widget UI cleanly
                     val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
                     val resetIntent = Intent(context, ElamalWidgetReceiver::class.java).apply {
                         action = "com.nanomks.elamal.ACTION_WIDGET_RESET_TAP"
@@ -1237,6 +1371,7 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
                         context, 101, resetIntent,
                         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                     )
+                    // Inexact one-shot alarm for battery saving
                     am.set(AlarmManager.RTC, now + 61_000L, pi)
                 }
                 refreshAllWidgets(context)
@@ -1303,7 +1438,7 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
 }
 EOF
 
-# 14. MainActivity (Complete App: PIN/Biometric Lock, Onboarding SAF, Home Wi-Fi Card, Historical Settlement Edit, Reports & Monthly Calendar)
+# 14. MainActivity (Complete v3.0.0 with ConnectivityManager Economical Callback, Charts, Custom Period PDF, Entry Editing)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/MainActivity.kt
 package com.nanomks.elamal
 
@@ -1311,12 +1446,17 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.biometric.BiometricPrompt
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -1331,6 +1471,8 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -1347,6 +1489,7 @@ import com.nanomks.elamal.util.BackupSafManager
 import com.nanomks.elamal.util.ElamalUtils
 import com.nanomks.elamal.util.PdfReportGenerator
 import com.nanomks.elamal.widget.ElamalWidgetReceiver
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -1355,13 +1498,47 @@ import java.text.SimpleDateFormat
 import java.util.*
 
 class MainActivity : FragmentActivity() {
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        registerEconomicalWifiCallback()
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 ElamalRootScreen(activity = this)
             }
         }
+    }
+
+    private fun registerEconomicalWifiCallback() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val dao = ElamalDatabase.getInstance(this).dao()
+        val req = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    ElamalUtils.pollAndMergeRootWifi(applicationContext, dao)
+                }
+            }
+
+            override fun onLost(network: Network) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    ElamalUtils.pollAndMergeRootWifi(applicationContext, dao)
+                }
+            }
+        }
+        networkCallback = cb
+        runCatching { cm.registerNetworkCallback(req, cb) }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        networkCallback?.let { runCatching { cm.unregisterNetworkCallback(it) } }
     }
 }
 
@@ -1374,9 +1551,8 @@ fun ElamalRootScreen(activity: FragmentActivity) {
     val dao = remember { db.dao() }
     val scope = rememberCoroutineScope()
 
-    // Appearance & Preferences
     val sysDark = isSystemInDarkTheme()
-    var themeMode by remember { mutableIntStateOf(prefs.getInt("theme_mode", 0)) } // 0: Auto, 1: Light, 2: Dark
+    var themeMode by remember { mutableIntStateOf(prefs.getInt("theme_mode", 0)) }
     val isDark = when (themeMode) {
         1 -> false
         2 -> true
@@ -1386,7 +1562,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
     var appColorHex by remember { mutableStateOf(prefs.getString("app_color_hex", "#10B981") ?: "#10B981") }
     var fontScale by remember { mutableFloatStateOf(prefs.getFloat("font_scale", 1.0f)) }
 
-    // Core Settings
     var hourlyRate by remember { mutableDoubleStateOf(prefs.getFloat("hourly_rate", 10.0f).toDouble()) }
     var activeClockIn by remember { mutableLongStateOf(prefs.getLong("active_clock_in", 0L)) }
     var widgetEnabled by remember { mutableStateOf(prefs.getBoolean("widget_enabled", true)) }
@@ -1396,7 +1571,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
     var backupUriStr by remember { mutableStateOf(prefs.getString("backup_uri", "") ?: "") }
     var firstRunDone by remember { mutableStateOf(prefs.getBoolean("first_run_done", false)) }
 
-    // Security PIN (4 to 8 digits) + 7 Failed Attempts Delay
     var savedPin by remember { mutableStateOf(prefs.getString("security_pin", "") ?: "") }
     var isUnlocked by remember { mutableStateOf(savedPin.isBlank()) }
     var failedPinAttempts by remember { mutableIntStateOf(prefs.getInt("failed_pin_attempts", 0)) }
@@ -1424,7 +1598,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
     }
 
     MaterialTheme(colorScheme = colorScheme) {
-        // 1. Security PIN Gate (4-8 digits, delay after 7 wrong attempts, Biometric shortcut)
         if (!isUnlocked) {
             var pinInput by remember { mutableStateOf("") }
             var pinError by remember { mutableStateOf("") }
@@ -1476,9 +1649,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                                     pinError = "رمز خاطئ ($failedPinAttempts / 7)"
                                 }
                             }
-                        }) {
-                            Text("فتح التطبيق")
-                        }
+                        }) { Text("فتح التطبيق") }
 
                         OutlinedButton(onClick = {
                             val executor = ContextCompat.getMainExecutor(context)
@@ -1504,13 +1675,12 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             return@MaterialTheme
         }
 
-        // 2. First Welcome Onboarding (Select SAF Backup Folder)
         if (!firstRunDone) {
             AlertDialog(
                 onDismissRequest = {},
                 title = { Text("مرحباً بك في تطبيق «العمل»") },
                 text = {
-                    Text("لحماية بياناتك وأجورك تلقائياً، يرجى اختيار مجلد لحفظ النسخ الاحتياطية التلقائية (عبر SAF) قبل البدء، أو يمكنك تخطي ذلك للإعدادات لاحقاً.")
+                    Text("لحماية بياناتك تلقائياً، يرجى اختيار مجلد لحفظ النسخ الاحتياطية (عبر SAF) عند الترحيب الأول.")
                 },
                 confirmButton = {
                     Button(onClick = { folderPicker.launch(null) }) {
@@ -1521,9 +1691,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                     TextButton(onClick = {
                         prefs.edit().putBoolean("first_run_done", true).apply()
                         firstRunDone = true
-                    }) {
-                        Text("تخطي الآن")
-                    }
+                    }) { Text("تخطي الآن") }
                 }
             )
         }
@@ -1545,14 +1713,19 @@ fun ElamalRootScreen(activity: FragmentActivity) {
         var showRemoteDialog by remember { mutableStateOf(false) }
         var showCreditDialog by remember { mutableStateOf(false) }
         var showSettleDialog by remember { mutableStateOf(false) }
+        var showCustomPeriodPdfDialog by remember { mutableStateOf(false) }
+        var editingEntry by remember { mutableStateOf<WorkEntry?>(null) }
         var editingSettlement by remember { mutableStateOf<Settlement?>(null) }
         var confirmIgnoreAllWifi by remember { mutableStateOf(false) }
 
-        // Minute ticker while app is open: updates active timer, polls Root Wi-Fi & triggers auto SAF backup
         var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
         var detectedRootSsid by remember { mutableStateOf<String?>(null) }
 
+        // Auto-sync widget queue when app opens (retaining events for 8s after DB save) + 1-minute ticker
         LaunchedEffect(Unit) {
+            withContext(Dispatchers.IO) {
+                ElamalUtils.processPendingWidgetEventsOnAppOpen(context, dao)
+            }
             while (true) {
                 nowMillis = System.currentTimeMillis()
                 activeClockIn = prefs.getLong("active_clock_in", 0L)
@@ -1632,7 +1805,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             ) {
                 when (currentTab) {
                     0 -> {
-                        // TAB 0: HOME & LEDGER
                         val lastCarryOver = settlements.firstOrNull()?.nextCarryOver ?: 0.0
                         val activeSum = entries.sumOf { it.calculatedAmount }
                         val totalNet = activeSum + lastCarryOver
@@ -1659,7 +1831,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             }
                         }
 
-                        // Pending Wi-Fi Sessions Card on Home Screen (Updates every minute while app is open)
                         if (pendingWifiList.isNotEmpty()) {
                             Spacer(modifier = Modifier.height(8.dp))
                             Card(
@@ -1748,19 +1919,23 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             items(filtered, key = { it.id }) { item ->
-                                EntryRowCard(item = item, fontScale = fontScale, onDelete = {
-                                    lastDeletedEntry = item
-                                    scope.launch {
-                                        dao.updateEntry(item.copy(isDeleted = true))
-                                        statusBanner = BackupSafManager.performSmartBackup(context, dao)
+                                EntryRowCard(
+                                    item = item,
+                                    fontScale = fontScale,
+                                    onEdit = { editingEntry = item },
+                                    onDelete = {
+                                        lastDeletedEntry = item
+                                        scope.launch {
+                                            dao.updateEntry(item.copy(isDeleted = true))
+                                            statusBanner = BackupSafManager.performSmartBackup(context, dao)
+                                        }
                                     }
-                                })
+                                )
                             }
                         }
                     }
 
                     1 -> {
-                        // TAB 1: SETTLEMENTS & ARCHIVE (With Historical Edit & Cascading Carry-Over)
                         Button(
                             onClick = { showSettleDialog = true },
                             modifier = Modifier.fillMaxWidth()
@@ -1796,8 +1971,16 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Text("تاريخ الدفعة: ${df.format(Date(s.timestamp))}", fontWeight = FontWeight.Bold)
-                                            IconButton(onClick = { editingSettlement = s }) {
-                                                Icon(Icons.Default.Edit, contentDescription = "تعديل الدفعة")
+                                            Row {
+                                                IconButton(onClick = {
+                                                    val sEntries = allEntries.filter { it.settlementId == s.id }
+                                                    PdfReportGenerator.generateAndSharePdf(context, "دفعة ${df.format(Date(s.timestamp))}", sEntries, listOf(s), isDark)
+                                                }) {
+                                                    Icon(Icons.Default.PictureAsPdf, contentDescription = "PDF للدفعة")
+                                                }
+                                                IconButton(onClick = { editingSettlement = s }) {
+                                                    Icon(Icons.Default.Edit, contentDescription = "تعديل الدفعة")
+                                                }
                                             }
                                         }
                                         Text("مجموع السجلات: ${s.entriesTotal} DH | مرحّل سابق: ${s.previousCarryOver} DH")
@@ -1811,7 +1994,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                     }
 
                     2 -> {
-                        // TAB 2: SUMMARIES, MONTHLY CALENDAR, WHATSAPP, CSV & 6 PDF REPORTS
                         val lastCarryOver = settlements.firstOrNull()?.nextCarryOver ?: 0.0
                         val activeSum = entries.sumOf { it.calculatedAmount }
                         val totalNet = activeSum + lastCarryOver
@@ -1873,11 +2055,9 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                                     ) { Text("كل الدفعات") }
 
                                     OutlinedButton(
-                                        onClick = {
-                                            PdfReportGenerator.generateAndSharePdf(context, "تقرير فترة كاملة", allEntries, settlements, isDark)
-                                        },
+                                        onClick = { showCustomPeriodPdfDialog = true },
                                         modifier = Modifier.weight(1f)
-                                    ) { Text("فترة") }
+                                    ) { Text("فترة مخصصة") }
                                 }
                             }
 
@@ -1894,21 +2074,48 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                                         },
                                         modifier = Modifier.weight(1f),
                                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
-                                    ) {
-                                        Text("مشاركة لواتساب")
-                                    }
+                                    ) { Text("مشاركة لواتساب") }
 
                                     OutlinedButton(
                                         onClick = { PdfReportGenerator.exportAndShareCsv(context, allEntries) },
                                         modifier = Modifier.weight(1f)
-                                    ) {
-                                        Text("تصدير CSV")
+                                    ) { Text("تصدير CSV") }
+                                }
+                            }
+
+                            item {
+                                // Visual Earnings & Credit Bar Chart
+                                val hourlySum = allEntries.filter { it.type == EntryType.HOURLY }.sumOf { it.calculatedAmount }
+                                val remoteSum = allEntries.filter { it.type == EntryType.REMOTE }.sumOf { it.calculatedAmount }
+                                val creditSum = kotlin.math.abs(allEntries.filter { it.type == EntryType.CREDIT }.sumOf { it.calculatedAmount })
+                                val maxVal = maxOf(hourlySum, remoteSum, creditSum, 1.0)
+
+                                Card(modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text("الرسم البياني للملخصات (ساعات / عن بعد / كريدي)", fontWeight = FontWeight.Bold)
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Canvas(modifier = Modifier.fillMaxWidth().height(90.dp)) {
+                                            val w = size.width
+                                            val h = size.height
+                                            val barW = w / 5f
+                                            val h1 = ((hourlySum / maxVal) * h).toFloat()
+                                            val h2 = ((remoteSum / maxVal) * h).toFloat()
+                                            val h3 = ((creditSum / maxVal) * h).toFloat()
+
+                                            drawRect(Color(0xFF059669), topLeft = Offset(barW * 0.5f, h - h1), size = Size(barW, h1))
+                                            drawRect(Color(0xFF2563EB), topLeft = Offset(barW * 2.0f, h - h2), size = Size(barW, h2))
+                                            drawRect(Color(0xFFDC2626), topLeft = Offset(barW * 3.5f, h - h3), size = Size(barW, h3))
+                                        }
+                                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceAround) {
+                                            Text("ساعات: ${hourlySum.toInt()}", fontSize = 11.sp, color = Color(0xFF34D399))
+                                            Text("عن بعد: ${remoteSum.toInt()}", fontSize = 11.sp, color = Color(0xFF60A5FA))
+                                            Text("كريدي: -${creditSum.toInt()}", fontSize = 11.sp, color = Color(0xFFF87171))
+                                        }
                                     }
                                 }
                             }
 
                             item {
-                                // Monthly Calendar Summary
                                 val cal = Calendar.getInstance()
                                 val currentMonth = cal.get(Calendar.MONTH)
                                 val currentYear = cal.get(Calendar.YEAR)
@@ -1965,7 +2172,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                     }
 
                     3 -> {
-                        // TAB 3: ECONOMICAL ROOT WI-FI TRACKER (Up to 6 Networks, <10m merge, 2.4G/5G merge)
                         Card(modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text("تتبع شبكات العمل بالرووت (حتى 6 شبكات بدون GPS)", fontWeight = FontWeight.Bold)
@@ -2061,7 +2267,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                     }
 
                     4 -> {
-                        // TAB 4: SETTINGS, SECURITY, APPEARANCE & SMART SAF BACKUP
                         val lastBackupMillis = prefs.getLong("last_backup_time", 0L)
                         val backupAgeHours = if (lastBackupMillis > 0L) (System.currentTimeMillis() - lastBackupMillis) / 3600_000L else -1L
                         var backupFilesList by remember { mutableStateOf(BackupSafManager.listAvailableBackups(context)) }
@@ -2296,7 +2501,84 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             }
         }
 
-        // Confirm Ignore All Wi-Fi Dialog
+        // Custom Date Range PDF Dialog
+        if (showCustomPeriodPdfDialog) {
+            val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            var fromDateStr by remember { mutableStateOf(df.format(Date(System.currentTimeMillis() - 14 * 86400_000L))) }
+            var toDateStr by remember { mutableStateOf(df.format(Date())) }
+
+            AlertDialog(
+                onDismissRequest = { showCustomPeriodPdfDialog = false },
+                title = { Text("تقرير PDF لفترة مخصصة") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(value = fromDateStr, onValueChange = { fromDateStr = it }, label = { Text("من تاريخ (yyyy-MM-dd)") })
+                        OutlinedTextField(value = toDateStr, onValueChange = { toDateStr = it }, label = { Text("إلى تاريخ (yyyy-MM-dd)") })
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        val startT = runCatching { df.parse(fromDateStr)?.time }.getOrNull() ?: 0L
+                        val endT = (runCatching { df.parse(toDateStr)?.time }.getOrNull() ?: System.currentTimeMillis()) + 86399_000L
+                        val rangeEntries = allEntries.filter { it.startTime in startT..endT }
+                        PdfReportGenerator.generateAndSharePdf(context, "فترة $fromDateStr إلى $toDateStr", rangeEntries, settlements, isDark)
+                        showCustomPeriodPdfDialog = false
+                    }) { Text("تصدير ومشاركة PDF") }
+                }
+            )
+        }
+
+        // Edit Existing Entry Dialog
+        if (editingEntry != null) {
+            val target = editingEntry!!
+            var noteStr by remember { mutableStateOf(target.note) }
+            var breakStr by remember { mutableStateOf(target.breakMinutes.toString()) }
+            var amountStr by remember { mutableStateOf(kotlin.math.abs(target.calculatedAmount).toString()) }
+
+            AlertDialog(
+                onDismissRequest = { editingEntry = null },
+                title = { Text("تعديل السجل") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (target.type == EntryType.HOURLY) {
+                            OutlinedTextField(
+                                value = breakStr,
+                                onValueChange = { breakStr = it },
+                                label = { Text("الاستراحة (دقائق)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                            )
+                        } else {
+                            OutlinedTextField(
+                                value = amountStr,
+                                onValueChange = { amountStr = it },
+                                label = { Text("المبلغ (DH)") },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+                            )
+                        }
+                        OutlinedTextField(value = noteStr, onValueChange = { noteStr = it }, label = { Text("الملاحظة") })
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        scope.launch {
+                            val updated = if (target.type == EntryType.HOURLY && target.endTime != null) {
+                                val brk = breakStr.toIntOrNull() ?: target.breakMinutes
+                                val recalc = ElamalUtils.calculateHourlyPay(target.startTime, target.endTime, brk, target.hourlyRateAtEntry)
+                                target.copy(breakMinutes = brk, calculatedAmount = recalc, note = noteStr)
+                            } else {
+                                val rawAmt = kotlin.math.abs(amountStr.toDoubleOrNull() ?: target.calculatedAmount)
+                                val signedAmt = if (target.type == EntryType.CREDIT) -rawAmt else rawAmt
+                                target.copy(calculatedAmount = signedAmt, note = noteStr)
+                            }
+                            dao.updateEntry(updated)
+                            statusBanner = BackupSafManager.performSmartBackup(context, dao)
+                            editingEntry = null
+                        }
+                    }) { Text("حفظ التعديل") }
+                }
+            )
+        }
+
         if (confirmIgnoreAllWifi) {
             AlertDialog(
                 onDismissRequest = { confirmIgnoreAllWifi = false },
@@ -2316,7 +2598,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             )
         }
 
-        // Historical Settlement Edit Dialog (With Automatic Cascading Carry-Over)
         if (editingSettlement != null) {
             val target = editingSettlement!!
             var paidInput by remember { mutableStateOf(target.amountPaid.toString()) }
@@ -2329,22 +2610,14 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                 title = { Text("تعديل دفعة قديمة (مع تحديث المرحّل لاحقاً)") },
                 text = {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = dateInput,
-                            onValueChange = { dateInput = it },
-                            label = { Text("التاريخ (yyyy-MM-dd)") }
-                        )
+                        OutlinedTextField(value = dateInput, onValueChange = { dateInput = it }, label = { Text("التاريخ (yyyy-MM-dd)") })
                         OutlinedTextField(
                             value = paidInput,
                             onValueChange = { paidInput = it },
                             label = { Text("المبلغ المستلم (DH)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
                         )
-                        OutlinedTextField(
-                            value = noteInput,
-                            onValueChange = { noteInput = it },
-                            label = { Text("الملاحظة") }
-                        )
+                        OutlinedTextField(value = noteInput, onValueChange = { noteInput = it }, label = { Text("الملاحظة") })
                     }
                 },
                 confirmButton = {
@@ -2362,7 +2635,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             )
         }
 
-        // Clock-out Dialog with Break Minutes
         if (showClockOutDialog) {
             var breakMinStr by remember { mutableStateOf("0") }
             var noteStr by remember { mutableStateOf("") }
@@ -2377,11 +2649,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             label = { Text("مدة الاستراحة (بالدقائق)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
                         )
-                        OutlinedTextField(
-                            value = noteStr,
-                            onValueChange = { noteStr = it },
-                            label = { Text("ملاحظة (اختياري)") }
-                        )
+                        OutlinedTextField(value = noteStr, onValueChange = { noteStr = it }, label = { Text("ملاحظة (اختياري)") })
                     }
                 },
                 confirmButton = {
@@ -2413,7 +2681,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             )
         }
 
-        // Remote Fixed Pay Dialog
         if (showRemoteDialog) {
             var amountStr by remember { mutableStateOf("") }
             var noteStr by remember { mutableStateOf("") }
@@ -2428,11 +2695,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             label = { Text("المبلغ الثابت (DH)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
                         )
-                        OutlinedTextField(
-                            value = noteStr,
-                            onValueChange = { noteStr = it },
-                            label = { Text("ملاحظة") }
-                        )
+                        OutlinedTextField(value = noteStr, onValueChange = { noteStr = it }, label = { Text("ملاحظة") })
                     }
                 },
                 confirmButton = {
@@ -2460,7 +2723,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             )
         }
 
-        // Credit (-) Dialog
         if (showCreditDialog) {
             var creditStr by remember { mutableStateOf("") }
             var noteStr by remember { mutableStateOf("") }
@@ -2475,11 +2737,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             label = { Text("قيمة الكريدي (DH)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
                         )
-                        OutlinedTextField(
-                            value = noteStr,
-                            onValueChange = { noteStr = it },
-                            label = { Text("ملاحظة") }
-                        )
+                        OutlinedTextField(value = noteStr, onValueChange = { noteStr = it }, label = { Text("ملاحظة") })
                     }
                 },
                 confirmButton = {
@@ -2507,7 +2765,6 @@ fun ElamalRootScreen(activity: FragmentActivity) {
             )
         }
 
-        // Settlement Dialog
         if (showSettleDialog) {
             val prevCarry = settlements.firstOrNull()?.nextCarryOver ?: 0.0
             val entriesSum = entries.sumOf { it.calculatedAmount }
@@ -2527,11 +2784,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
                             label = { Text("المبلغ المستلم فعلياً (DH)") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
                         )
-                        OutlinedTextField(
-                            value = noteStr,
-                            onValueChange = { noteStr = it },
-                            label = { Text("ملاحظة الدفعة") }
-                        )
+                        OutlinedTextField(value = noteStr, onValueChange = { noteStr = it }, label = { Text("ملاحظة الدفعة") })
                     }
                 },
                 confirmButton = {
@@ -2562,7 +2815,7 @@ fun ElamalRootScreen(activity: FragmentActivity) {
 }
 
 @Composable
-fun EntryRowCard(item: WorkEntry, fontScale: Float, onDelete: () -> Unit) {
+fun EntryRowCard(item: WorkEntry, fontScale: Float, onEdit: () -> Unit, onDelete: () -> Unit) {
     val badgeColor = when (item.type) {
         EntryType.HOURLY -> Color(0xFF059669)
         EntryType.REMOTE -> Color(0xFF2563EB)
@@ -2574,7 +2827,7 @@ fun EntryRowCard(item: WorkEntry, fontScale: Float, onDelete: () -> Unit) {
         EntryType.CREDIT -> "كريدي"
     }
 
-    Card(modifier = Modifier.fillMaxWidth()) {
+    Card(modifier = Modifier.fillMaxWidth().clickable { onEdit() }) {
         Row(
             modifier = Modifier.padding(12.dp).fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -2620,4 +2873,4 @@ cat << 'EOF' > app/proguard-rules.pro
 -keep class com.nanomks.elamal.** { *; }
 EOF
 
-echo "=== Complete Elamal v2.0.0 Project Setup Finished ==="
+echo "=== Complete Elamal v3.0.0 Project Setup Finished ==="
