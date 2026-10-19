@@ -22,8 +22,9 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Accept Android SDK Licenses Directly
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: Decode Keystore from GitHub Secrets
         env:
@@ -41,7 +42,7 @@ jobs:
           chmod +x setup_project.sh
           ./setup_project.sh
 
-      - name: Setup Gradle 8.7 and Wrapper
+      - name: Setup Gradle 8.7
         uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: '8.7'
