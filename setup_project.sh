@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-echo "=== Generating Elamal (com.nanomks.elamal) Project Structure ==="
+echo "=== Generating Complete Elamal (com.nanomks.elamal) Project ==="
 
 mkdir -p app/src/main/java/com/nanomks/elamal/data
 mkdir -p app/src/main/java/com/nanomks/elamal/util
@@ -50,7 +50,7 @@ android.nonTransitiveRClass=true
 kotlin.code.style=official
 EOF
 
-# 4. app/build.gradle.kts (With GitHub Secrets Signing Config)
+# 4. app/build.gradle.kts
 cat << 'EOF' > app/build.gradle.kts
 plugins {
     id("com.android.application")
@@ -66,8 +66,8 @@ android {
         applicationId = "com.nanomks.elamal"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "2.0.0"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -128,6 +128,7 @@ dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.04.01")
     implementation(composeBom)
     implementation("androidx.core:core-ktx:1.12.0")
+    implementation("androidx.fragment:fragment-ktx:1.6.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0")
     implementation("androidx.activity:activity-compose:1.8.2")
@@ -138,7 +139,6 @@ dependencies {
     implementation("androidx.biometric:biometric:1.1.0")
     implementation("androidx.documentfile:documentfile:1.0.1")
 
-    // Room Database
     val roomVersion = "2.6.1"
     implementation("androidx.room:room-runtime:$roomVersion")
     implementation("androidx.room:room-ktx:$roomVersion")
@@ -146,7 +146,7 @@ dependencies {
 }
 EOF
 
-# 5. Resources: strings.xml & themes.xml
+# 5. Resources: strings.xml, themes.xml, file_paths.xml
 cat << 'EOF' > app/src/main/res/values/strings.xml
 <resources>
     <string name="app_name">العمل</string>
@@ -160,7 +160,14 @@ cat << 'EOF' > app/src/main/res/values/themes.xml
 </resources>
 EOF
 
-# 6. Adaptive Icons (Default + Alternative + Monochrome Layer)
+cat << 'EOF' > app/src/main/res/xml/file_paths.xml
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <cache-path name="shared_reports" path="reports/" />
+</paths>
+EOF
+
+# 6. Adaptive Icons (Default + Alt + Monochrome Layer)
 cat << 'EOF' > app/src/main/res/drawable/ic_launcher_background.xml
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -254,7 +261,7 @@ cat << 'EOF' > app/src/main/res/xml/widget_info.xml
     android:widgetCategory="home_screen" />
 EOF
 
-# 8. AndroidManifest.xml (No Location Permissions! Uses Root for SSID + Activity Aliases)
+# 8. AndroidManifest.xml
 cat << 'EOF' > app/src/main/AndroidManifest.xml
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
@@ -312,16 +319,28 @@ cat << 'EOF' > app/src/main/AndroidManifest.xml
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
                 <action android:name="com.nanomks.elamal.ACTION_WIDGET_CLICK" />
+                <action android:name="com.nanomks.elamal.ACTION_WIDGET_RESET_TAP" />
+                <action android:name="com.nanomks.elamal.ACTION_FORGOT_CLOCK_OUT" />
             </intent-filter>
             <meta-data
                 android:name="android.appwidget.provider"
                 android:resource="@xml/widget_info" />
         </receiver>
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>
 EOF
 
-# 9. Database Entities & DAO & Cascading Recalculation
+# 9. Database Entities & DAO
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/data/Entities.kt
 package com.nanomks.elamal.data
 
@@ -380,6 +399,9 @@ interface ElamalDao {
     fun getActiveEntries(): Flow<List<WorkEntry>>
 
     @Query("SELECT * FROM work_entries WHERE isDeleted = 0 ORDER BY startTime DESC")
+    fun getAllNonDeletedEntriesFlow(): Flow<List<WorkEntry>>
+
+    @Query("SELECT * FROM work_entries WHERE isDeleted = 0 ORDER BY startTime DESC")
     suspend fun getAllEntriesSync(): List<WorkEntry>
 
     @Query("SELECT * FROM settlements ORDER BY timestamp DESC")
@@ -391,11 +413,20 @@ interface ElamalDao {
     @Query("SELECT * FROM wifi_sessions WHERE status != 'IGNORED' ORDER BY startTime DESC")
     fun getVisibleWifiSessions(): Flow<List<WifiSession>>
 
+    @Query("SELECT * FROM wifi_sessions ORDER BY endTime DESC LIMIT 1")
+    suspend fun getLatestWifiSessionSync(): WifiSession?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertEntry(entry: WorkEntry): Long
 
     @Update
     suspend fun updateEntry(entry: WorkEntry)
+
+    @Query("DELETE FROM work_entries")
+    suspend fun clearEntries()
+
+    @Query("DELETE FROM settlements")
+    suspend fun clearSettlements()
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSettlement(settlement: Settlement): Long
@@ -440,7 +471,7 @@ interface ElamalDao {
     }
 }
 
-@Database(entities = [WorkEntry::class, Settlement::class, WifiSession::class], version = 1, exportSchema = false)
+@Database(entities = [WorkEntry::class, Settlement::class, WifiSession::class], version = 2, exportSchema = false)
 abstract class ElamalDatabase : RoomDatabase() {
     abstract fun dao(): ElamalDao
 
@@ -454,23 +485,35 @@ abstract class ElamalDatabase : RoomDatabase() {
                     context.applicationContext,
                     ElamalDatabase::class.java,
                     "elamal_db"
-                ).build().also { INSTANCE = it }
+                ).fallbackToDestructiveMigration().build().also { INSTANCE = it }
             }
         }
     }
 }
 EOF
 
-# 10. Root Wi-Fi Reader + Calculators + Encryption Helper
+# 10. ElamalUtils: Pay Calculators, Root Wi-Fi Merger (<10m), AES-GCM Encrypt/Decrypt, Alarms
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/ElamalUtils.kt
 package com.nanomks.elamal.util
 
+import android.app.AlarmManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import com.nanomks.elamal.data.ElamalDao
+import com.nanomks.elamal.data.EntryType
+import com.nanomks.elamal.data.WifiSession
+import com.nanomks.elamal.data.WorkEntry
+import com.nanomks.elamal.widget.ElamalWidgetReceiver
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.security.SecureRandom
+import java.text.SimpleDateFormat
 import java.util.Base64
+import java.util.Date
+import java.util.Locale
 import javax.crypto.Cipher
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.GCMParameterSpec
@@ -493,16 +536,12 @@ object ElamalUtils {
         return "${h} س ${m} د"
     }
 
-    /**
-     * Reads current connected Wi-Fi SSID using Root (su) without GPS or Location permissions.
-     */
     fun getConnectedSsidViaRoot(): String? {
         return try {
             val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "cmd wifi status"))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val output = reader.readText()
             process.waitFor()
-            // Match SSID: "NetworkName"
             val regex = Regex("""SSID:\s*"([^"]+)"""")
             val match = regex.find(output)
             match?.groupValues?.getOrNull(1)?.takeIf { it != "<unknown ssid>" }
@@ -512,8 +551,64 @@ object ElamalUtils {
     }
 
     /**
-     * AES-GCM Encryption with user Backup Password
+     * Economical Root Wi-Fi session tracker:
+     * Supports up to 6 work SSIDs, merges short disconnects (< 10 mins) and merges switching between work networks (2.4G / 5G).
      */
+    suspend fun pollAndMergeRootWifi(context: Context, dao: ElamalDao): String? {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val configuredList = (prefs.getString("work_ssids", "") ?: "")
+            .split(",")
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(6)
+
+        val currentSsid = getConnectedSsidViaRoot()
+        val now = System.currentTimeMillis()
+
+        if (currentSsid != null && configuredList.any { it.equals(currentSsid, ignoreCase = true) }) {
+            val latest = dao.getLatestWifiSessionSync()
+            // Merge if last session was PENDING and ended less than 10 minutes ago (even across 2 different work SSIDs!)
+            if (latest != null && latest.status == "PENDING" && (now - latest.endTime) <= 10 * 60_000L) {
+                val mergedName = if (latest.ssid.contains(currentSsid)) latest.ssid else "${latest.ssid}+${currentSsid}"
+                dao.updateWifiSession(latest.copy(ssid = mergedName, endTime = now))
+            } else {
+                dao.insertWifiSession(WifiSession(ssid = currentSsid, startTime = now, endTime = now, status = "PENDING"))
+            }
+        }
+        return currentSsid
+    }
+
+    fun scheduleForgotClockOutAlarm(context: Context, startMillis: Long) {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val limitHours = prefs.getInt("forgot_alarm_hours", 12).coerceIn(0, 48)
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, ElamalWidgetReceiver::class.java).apply {
+            action = "com.nanomks.elamal.ACTION_FORGOT_CLOCK_OUT"
+        }
+        val pi = PendingIntent.getBroadcast(
+            context, 202, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        if (limitHours == 0) {
+            alarmManager.cancel(pi)
+            return
+        }
+        val triggerAt = startMillis + (limitHours * 3600_000L)
+        alarmManager.set(AlarmManager.RTC_WAKEUP, triggerAt, pi)
+    }
+
+    fun cancelForgotClockOutAlarm(context: Context) {
+        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val intent = Intent(context, ElamalWidgetReceiver::class.java).apply {
+            action = "com.nanomks.elamal.ACTION_FORGOT_CLOCK_OUT"
+        }
+        val pi = PendingIntent.getBroadcast(
+            context, 202, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        alarmManager.cancel(pi)
+    }
+
     fun encryptBackup(plainJson: String, password: String): String {
         if (password.isBlank()) return plainJson
         val salt = ByteArray(16).apply { SecureRandom().nextBytes(this) }
@@ -527,13 +622,537 @@ object ElamalUtils {
         val enc = Base64.getEncoder()
         return "ELAMAL_ENC_V1:" + enc.encodeToString(salt) + ":" + enc.encodeToString(iv) + ":" + enc.encodeToString(encrypted)
     }
+
+    fun decryptBackup(payload: String, password: String): String {
+        if (!payload.startsWith("ELAMAL_ENC_V1:")) return payload
+        val parts = payload.split(":")
+        require(parts.size == 4) { "ملف مشفر غير صالح" }
+        val dec = Base64.getDecoder()
+        val salt = dec.decode(parts[1])
+        val iv = dec.decode(parts[2])
+        val cipherBytes = dec.decode(parts[3])
+        val spec = PBEKeySpec(password.toCharArray(), salt, 10000, 256)
+        val secret = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256").generateSecret(spec).encoded
+        val keySpec = SecretKeySpec(secret, "AES")
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        cipher.init(Cipher.DECRYPT_MODE, keySpec, GCMParameterSpec(128, iv))
+        return String(cipher.doFinal(cipherBytes), Charsets.UTF_8)
+    }
+
+    fun buildWhatsappFormattedText(entries: List<WorkEntry>, totalNet: Double, carryOver: Double): String {
+        val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val sb = StringBuilder()
+        sb.append("*📊 ملخص تطبيق «العمل»*\n")
+        sb.append("━━━━━━━━━━━━━━\n")
+        var totalMins = 0L
+        for (e in entries) {
+            val dateStr = df.format(Date(e.startTime))
+            val typeStr = when (e.type) {
+                EntryType.HOURLY -> {
+                    val m = if (e.endTime != null) ((e.endTime - e.startTime) / 60000L) - e.breakMinutes else 0L
+                    totalMins += m.coerceAtLeast(0)
+                    "ساعات (${formatDurationArabic(m)})"
+                }
+                EntryType.REMOTE -> "عمل عن بعد"
+                EntryType.CREDIT -> "كريدي (-)"
+            }
+            val notePart = if (e.note.isNotBlank()) " - ${e.note}" else ""
+            sb.append("• $dateStr | $typeStr: *${String.format(Locale.US, "%.2f DH", e.calculatedAmount)}*$notePart\n")
+        }
+        sb.append("━━━━━━━━━━━━━━\n")
+        sb.append("⏱ *مجموع الساعات:* ${formatDurationArabic(totalMins)}\n")
+        if (carryOver != 0.0) {
+            sb.append("🔄 *رصيد مرحّل:* ${String.format(Locale.US, "%.2f DH", carryOver)}\n")
+        }
+        sb.append("💰 *الصافي المستحق:* *${String.format(Locale.US, "%.2f DH", totalNet)}*")
+        return sb.toString()
+    }
 }
 EOF
 
-# 11. Widget Receiver (2-Tap Confirmation within 60s + Disabled Toggle + Idempotent)
+# 11. PDF & CSV Generator (Light/Dark theme support, Colored Summary Cards, Full Grid, Type Badges, Total Row, Creation Footer)
+cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/PdfReportGenerator.kt
+package com.nanomks.elamal.util
+
+import android.content.Context
+import android.content.Intent
+import android.graphics.*
+import android.graphics.pdf.PdfDocument
+import androidx.core.content.FileProvider
+import com.nanomks.elamal.data.EntryType
+import com.nanomks.elamal.data.Settlement
+import com.nanomks.elamal.data.WorkEntry
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
+
+object PdfReportGenerator {
+
+    fun generateAndSharePdf(
+        context: Context,
+        reportTitle: String,
+        entries: List<WorkEntry>,
+        settlements: List<Settlement>,
+        isDarkMode: Boolean
+    ) {
+        val doc = PdfDocument()
+        val pageWidth = 595
+        val pageHeight = 842
+        val pageInfo = PdfDocument.PageInfo.Builder(pageWidth, pageHeight, 1).create()
+        val page = doc.startPage(pageInfo)
+        val canvas = page.canvas
+
+        val bgColor = if (isDarkMode) Color.parseColor("#0F172A") else Color.parseColor("#FFFFFF")
+        val textColor = if (isDarkMode) Color.parseColor("#F8FAFC") else Color.parseColor("#0F172A")
+        val subTextColor = if (isDarkMode) Color.parseColor("#94A3B8") else Color.parseColor("#475569")
+        val gridColor = if (isDarkMode) Color.parseColor("#334155") else Color.parseColor("#CBD5E1")
+        val headerBg = if (isDarkMode) Color.parseColor("#1E293B") else Color.parseColor("#F1F5F9")
+
+        canvas.drawColor(bgColor)
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+        val dfDateTime = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+        val dfDate = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+
+        // Header Title
+        paint.color = textColor
+        paint.textSize = 20f
+        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        paint.textAlign = Paint.Align.RIGHT
+        canvas.drawText("تقرير «العمل» - $reportTitle", (pageWidth - 36).toFloat(), 48f, paint)
+
+        // Summary Calculations
+        var totalHourlyMinutes = 0L
+        var totalRemote = 0.0
+        var totalCredit = 0.0
+        var netTotal = 0.0
+        for (e in entries) {
+            netTotal += e.calculatedAmount
+            when (e.type) {
+                EntryType.HOURLY -> {
+                    if (e.endTime != null) {
+                        totalHourlyMinutes += (((e.endTime - e.startTime) / 60000L) - e.breakMinutes).coerceAtLeast(0)
+                    }
+                }
+                EntryType.REMOTE -> totalRemote += e.calculatedAmount
+                EntryType.CREDIT -> totalCredit += e.calculatedAmount
+            }
+        }
+
+        // 3 Colored Summary Cards
+        val cardTop = 70f
+        val cardBottom = 135f
+        val cardW = 165f
+
+        // Card 1: Net Total (Green)
+        paint.color = if (isDarkMode) Color.parseColor("#064E3B") else Color.parseColor("#D1FAE5")
+        canvas.drawRoundRect(RectF(pageWidth - 36f - cardW, cardTop, pageWidth - 36f, cardBottom), 10f, 10f, paint)
+        paint.color = if (isDarkMode) Color.parseColor("#34D399") else Color.parseColor("#065F46")
+        paint.textSize = 11f
+        canvas.drawText("الصافي الإجمالي", pageWidth - 48f, cardTop + 24f, paint)
+        paint.textSize = 15f
+        canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), pageWidth - 48f, cardTop + 48f, paint)
+
+        // Card 2: Total Hours (Blue)
+        val c2Right = pageWidth - 36f - cardW - 14f
+        paint.color = if (isDarkMode) Color.parseColor("#1E3A8A") else Color.parseColor("#DBEAFE")
+        canvas.drawRoundRect(RectF(c2Right - cardW, cardTop, c2Right, cardBottom), 10f, 10f, paint)
+        paint.color = if (isDarkMode) Color.parseColor("#60A5FA") else Color.parseColor("#1E40AF")
+        paint.textSize = 11f
+        canvas.drawText("مجموع الساعات", c2Right - 12f, cardTop + 24f, paint)
+        paint.textSize = 15f
+        canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), c2Right - 12f, cardTop + 48f, paint)
+
+        // Card 3: Credit & Remote (Amber/Red)
+        val c3Right = c2Right - cardW - 14f
+        paint.color = if (isDarkMode) Color.parseColor("#7F1D1D") else Color.parseColor("#FEE2E2")
+        canvas.drawRoundRect(RectF(36f, cardTop, c3Right, cardBottom), 10f, 10f, paint)
+        paint.color = if (isDarkMode) Color.parseColor("#F87171") else Color.parseColor("#991B1B")
+        paint.textSize = 11f
+        canvas.drawText("الكريدي / عن بعد", c3Right - 12f, cardTop + 24f, paint)
+        paint.textSize = 13f
+        canvas.drawText("${String.format(Locale.US, "%.1f", totalCredit)} / +${String.format(Locale.US, "%.1f", totalRemote)}", c3Right - 12f, cardTop + 48f, paint)
+
+        // Table with Full Grid
+        var y = 160f
+        val leftX = 36f
+        val rightX = pageWidth - 36f
+        val rowH = 26f
+        val col1 = rightX - 95f   // Date
+        val col2 = col1 - 80f     // Type Badge
+        val col3 = col2 - 95f     // Duration
+        val col4 = col3 - 150f    // Note (Remaining is Amount)
+
+        // Table Header Row
+        paint.color = headerBg
+        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+        paint.color = gridColor
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 1f
+        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = textColor
+        paint.textSize = 11f
+        canvas.drawText("التاريخ", rightX - 8f, y + 17f, paint)
+        canvas.drawText("النوع", col1 - 8f, y + 17f, paint)
+        canvas.drawText("المدة", col2 - 8f, y + 17f, paint)
+        canvas.drawText("الملاحظة", col3 - 8f, y + 17f, paint)
+        canvas.drawText("الأجرة", col4 - 8f, y + 17f, paint)
+        y += rowH
+
+        val maxRows = entries.take(20)
+        for (e in maxRows) {
+            paint.style = Paint.Style.STROKE
+            paint.color = gridColor
+            canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+            canvas.drawLine(col1, y, col1, y + rowH, paint)
+            canvas.drawLine(col2, y, col2, y + rowH, paint)
+            canvas.drawLine(col3, y, col3, y + rowH, paint)
+            canvas.drawLine(col4, y, col4, y + rowH, paint)
+
+            paint.style = Paint.Style.FILL
+            paint.color = textColor
+            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+            canvas.drawText(dfDate.format(Date(e.startTime)), rightX - 8f, y + 17f, paint)
+
+            // Type Badge
+            val badgeBg = when (e.type) {
+                EntryType.HOURLY -> Color.parseColor("#059669")
+                EntryType.REMOTE -> Color.parseColor("#2563EB")
+                EntryType.CREDIT -> Color.parseColor("#DC2626")
+            }
+            val badgeTxt = when (e.type) {
+                EntryType.HOURLY -> "ساعات"
+                EntryType.REMOTE -> "عن بعد"
+                EntryType.CREDIT -> "كريدي"
+            }
+            paint.color = badgeBg
+            canvas.drawRoundRect(RectF(col2 + 8f, y + 4f, col1 - 8f, y + rowH - 4f), 6f, 6f, paint)
+            paint.color = Color.WHITE
+            paint.textSize = 10f
+            canvas.drawText(badgeTxt, col1 - 14f, y + 17f, paint)
+
+            // Duration formatted «23 س 58 د»
+            paint.color = textColor
+            paint.textSize = 10f
+            val durStr = if (e.type == EntryType.HOURLY && e.endTime != null) {
+                val mins = ((e.endTime - e.startTime) / 60000L) - e.breakMinutes
+                ElamalUtils.formatDurationArabic(mins)
+            } else "-"
+            canvas.drawText(durStr, col2 - 8f, y + 17f, paint)
+
+            // Note
+            canvas.drawText(e.note.take(22), col3 - 8f, y + 17f, paint)
+
+            // Amount
+            paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+            paint.color = if (e.calculatedAmount < 0) Color.parseColor("#EF4444") else textColor
+            canvas.drawText(String.format(Locale.US, "%.2f DH", e.calculatedAmount), col4 - 8f, y + 17f, paint)
+
+            y += rowH
+        }
+
+        // Total Summary Row at bottom of table
+        paint.style = Paint.Style.FILL
+        paint.color = headerBg
+        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+        paint.style = Paint.Style.STROKE
+        paint.color = gridColor
+        canvas.drawRect(leftX, y, rightX, y + rowH, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.color = textColor
+        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        paint.textSize = 11f
+        canvas.drawText("المجموع النهائي", rightX - 8f, y + 17f, paint)
+        canvas.drawText(ElamalUtils.formatDurationArabic(totalHourlyMinutes), col2 - 8f, y + 17f, paint)
+        canvas.drawText(String.format(Locale.US, "%.2f DH", netTotal), col4 - 8f, y + 17f, paint)
+
+        // Footer with Creation Timestamp
+        paint.color = subTextColor
+        paint.textSize = 10f
+        paint.typeface = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
+        canvas.drawText(
+            "تطبيق «العمل» (com.nanomks.elamal) - تاريخ الإنشاء: ${dfDateTime.format(Date())}",
+            rightX,
+            pageHeight - 28f,
+            paint
+        )
+
+        doc.finishPage(page)
+
+        val reportsDir = File(context.cacheDir, "reports").apply { mkdirs() }
+        val pdfFile = File(reportsDir, "Elamal_Report_${System.currentTimeMillis()}.pdf")
+        FileOutputStream(pdfFile).use { doc.writeTo(it) }
+        doc.close()
+
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", pdfFile)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "application/pdf"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(shareIntent, "مشاركة تقرير PDF"))
+    }
+
+    fun exportAndShareCsv(context: Context, entries: List<WorkEntry>) {
+        val reportsDir = File(context.cacheDir, "reports").apply { mkdirs() }
+        val csvFile = File(reportsDir, "Elamal_Export_${System.currentTimeMillis()}.csv")
+        val df = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+
+        FileOutputStream(csvFile).use { fos ->
+            // UTF-8 BOM for Arabic Excel support
+            fos.write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
+            val sb = StringBuilder()
+            sb.append("المعرف,النوع,البداية,النهاية,الاستراحة(د),المدة,الأجرة(DH),الملاحظة\n")
+            for (e in entries) {
+                val mins = if (e.endTime != null) ((e.endTime - e.startTime) / 60000L) - e.breakMinutes else 0L
+                val dur = if (e.type == EntryType.HOURLY) ElamalUtils.formatDurationArabic(mins) else "-"
+                val endStr = e.endTime?.let { df.format(Date(it)) } ?: ""
+                val cleanNote = e.note.replace(",", " ")
+                sb.append("${e.id},${e.type},${df.format(Date(e.startTime))},$endStr,${e.breakMinutes},$dur,${e.calculatedAmount},$cleanNote\n")
+            }
+            fos.write(sb.toString().toByteArray(Charsets.UTF_8))
+        }
+
+        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", csvFile)
+        val shareIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/csv"
+            putExtra(Intent.EXTRA_STREAM, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        context.startActivity(Intent.createChooser(shareIntent, "تصدير CSV"))
+    }
+}
+EOF
+
+# 12. Smart SAF Backup Manager (5 Safety Rotating Slots ONLY on data loss + Read-back Verify + Pre-restore Backup)
+cat << 'EOF' > app/src/main/java/com/nanomks/elamal/util/BackupSafManager.kt
+package com.nanomks.elamal.util
+
+import android.content.Context
+import android.net.Uri
+import androidx.documentfile.provider.DocumentFile
+import com.nanomks.elamal.data.*
+import org.json.JSONArray
+import org.json.JSONObject
+
+object BackupSafManager {
+
+    suspend fun performSmartBackup(
+        context: Context,
+        dao: ElamalDao,
+        isManual: Boolean = false
+    ): String {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val uriStr = prefs.getString("backup_uri", "") ?: ""
+        if (uriStr.isBlank()) return "لم يتم اختيار مجلد النسخ الاحتياطي بعد"
+
+        val treeUri = Uri.parse(uriStr)
+        val dir = DocumentFile.fromTreeUri(context, treeUri) ?: return "تعذر الوصول إلى المجلد"
+
+        val entries = dao.getAllEntriesSync()
+        val settlements = dao.getSettlementsAsc()
+        val activeClockIn = prefs.getLong("active_clock_in", 0L)
+
+        // Protection 1: Never overwrite a good backup with an empty dataset
+        val prevEntriesCount = prefs.getInt("last_backup_entries_count", 0)
+        val prevSettlementsCount = prefs.getInt("last_backup_settlements_count", 0)
+        val prevHadClockIn = prefs.getBoolean("last_backup_had_clockin", false)
+
+        if (entries.isEmpty() && settlements.isEmpty() && activeClockIn == 0L && (prevEntriesCount > 0 || prevSettlementsCount > 0)) {
+            return "حماية تلقائية: تم منع الكتابة بنسخة فارغة فوق نسخة تحتوي على بيانات!"
+        }
+
+        // Protection 2: 5 Rotating Safety Backups ONLY triggered when data decreases (deleted record, lost clock-in, reduced archive)
+        val dataDecreased = (entries.size < prevEntriesCount) ||
+                (settlements.size < prevSettlementsCount) ||
+                (prevHadClockIn && activeClockIn == 0L && entries.size <= prevEntriesCount)
+
+        val mainFile = dir.findFile("elamal_auto_backup.json")
+        if (!isManual && dataDecreased && mainFile != null) {
+            val prevContent = readUriText(context, mainFile.uri)
+            if (prevContent.isNotBlank()) {
+                val slot = (prefs.getInt("safety_slot_index", 0) % 5) + 1
+                prefs.edit().putInt("safety_slot_index", slot).apply()
+                val safetyName = "elamal_safety_slot_${slot}.json"
+                writeToDocumentFile(context, dir, safetyName, prevContent)
+            }
+        }
+
+        // Serialize current state to JSON
+        val root = JSONObject()
+        root.put("version", 2)
+        root.put("timestamp", System.currentTimeMillis())
+        root.put("activeClockIn", activeClockIn)
+        root.put("hourlyRate", prefs.getFloat("hourly_rate", 10f).toDouble())
+
+        val entriesArr = JSONArray()
+        for (e in entries) {
+            val obj = JSONObject().apply {
+                put("id", e.id)
+                put("type", e.type.name)
+                put("startTime", e.startTime)
+                put("endTime", e.endTime ?: -1L)
+                put("breakMinutes", e.breakMinutes)
+                put("hourlyRateAtEntry", e.hourlyRateAtEntry)
+                put("calculatedAmount", e.calculatedAmount)
+                put("note", e.note)
+                put("settlementId", e.settlementId ?: -1L)
+            }
+            entriesArr.put(obj)
+        }
+        root.put("entries", entriesArr)
+
+        val settlementsArr = JSONArray()
+        for (s in settlements) {
+            val obj = JSONObject().apply {
+                put("id", s.id)
+                put("timestamp", s.timestamp)
+                put("entriesTotal", s.entriesTotal)
+                put("previousCarryOver", s.previousCarryOver)
+                put("amountPaid", s.amountPaid)
+                put("nextCarryOver", s.nextCarryOver)
+                put("note", s.note)
+            }
+            settlementsArr.put(obj)
+        }
+        root.put("settlements", settlementsArr)
+
+        val rawJson = root.toString(2)
+        val encEnabled = prefs.getBoolean("backup_encrypt_enabled", false)
+        val encPass = prefs.getString("backup_password", "") ?: ""
+        val finalPayload = if (encEnabled && encPass.isNotBlank()) {
+            ElamalUtils.encryptBackup(rawJson, encPass)
+        } else {
+            rawJson
+        }
+
+        val targetFileName = if (isManual) {
+            "elamal_manual_${System.currentTimeMillis()}.json"
+        } else {
+            "elamal_auto_backup.json"
+        }
+
+        val writtenUri = writeToDocumentFile(context, dir, targetFileName, finalPayload)
+            ?: return "فشل إنشاء ملف النسخة الاحتياطية"
+
+        // Protection 3: Read-back Verification after write
+        val verifyRead = readUriText(context, writtenUri)
+        if (verifyRead != finalPayload) {
+            return "تحذير: فشل التحقق من سلامة الملف بعد الكتابة!"
+        }
+
+        prefs.edit()
+            .putInt("last_backup_entries_count", entries.size)
+            .putInt("last_backup_settlements_count", settlements.size)
+            .putBoolean("last_backup_had_clockin", activeClockIn > 0L)
+            .putLong("last_backup_time", System.currentTimeMillis())
+            .apply()
+
+        return if (dataDecreased && !isManual) {
+            "تم الحفظ وتدوير نسخة أمان (بسبب رصد نقص بيانات) ✓"
+        } else {
+            "تم النسخ الاحتياطي والتحقق من سلامته بنجاح ✓"
+        }
+    }
+
+    suspend fun restoreFromBackup(context: Context, dao: ElamalDao, fileName: String = "elamal_auto_backup.json"): String {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val uriStr = prefs.getString("backup_uri", "") ?: ""
+        if (uriStr.isBlank()) return "اختر مجلد النسخ أولاً"
+        val dir = DocumentFile.fromTreeUri(context, Uri.parse(uriStr)) ?: return "المجلد غير متاح"
+        val target = dir.findFile(fileName) ?: return "الملف $fileName غير موجود"
+
+        // Protection: Pre-restore automatic snapshot
+        performSmartBackup(context, dao, isManual = true)
+
+        val content = readUriText(context, target.uri)
+        val pass = prefs.getString("backup_password", "") ?: ""
+        val jsonStr = try {
+            ElamalUtils.decryptBackup(content, pass)
+        } catch (e: Exception) {
+            return "فشل فك التشفير: تأكد من كلمة مرور النسخ الاحتياطي"
+        }
+
+        return try {
+            val root = JSONObject(jsonStr)
+            dao.clearEntries()
+            dao.clearSettlements()
+
+            val entriesArr = root.getJSONArray("entries")
+            for (i in 0 until entriesArr.length()) {
+                val o = entriesArr.getJSONObject(i)
+                val endT = o.getLong("endTime").let { if (it == -1L) null else it }
+                val setId = o.getLong("settlementId").let { if (it == -1L) null else it }
+                dao.insertEntry(
+                    WorkEntry(
+                        id = o.getLong("id"),
+                        type = EntryType.valueOf(o.getString("type")),
+                        startTime = o.getLong("startTime"),
+                        endTime = endT,
+                        breakMinutes = o.getInt("breakMinutes"),
+                        hourlyRateAtEntry = o.getDouble("hourlyRateAtEntry"),
+                        calculatedAmount = o.getDouble("calculatedAmount"),
+                        note = o.getString("note"),
+                        settlementId = setId
+                    )
+                )
+            }
+
+            val settlementsArr = root.getJSONArray("settlements")
+            for (i in 0 until settlementsArr.length()) {
+                val o = settlementsArr.getJSONObject(i)
+                dao.insertSettlement(
+                    Settlement(
+                        id = o.getLong("id"),
+                        timestamp = o.getLong("timestamp"),
+                        entriesTotal = o.getDouble("entriesTotal"),
+                        previousCarryOver = o.getDouble("previousCarryOver"),
+                        amountPaid = o.getDouble("amountPaid"),
+                        nextCarryOver = o.getDouble("nextCarryOver"),
+                        note = o.getString("note")
+                    )
+                )
+            }
+            "تمت الاستعادة بنجاح (مع حفظ نسخة أمان قبل الاستعادة) ✓"
+        } catch (e: Exception) {
+            "خطأ أثناء قراءة بيانات النسخة: ${e.message}"
+        }
+    }
+
+    fun listAvailableBackups(context: Context): List<String> {
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
+        val uriStr = prefs.getString("backup_uri", "") ?: return emptyList()
+        if (uriStr.isBlank()) return emptyList()
+        val dir = DocumentFile.fromTreeUri(context, Uri.parse(uriStr)) ?: return emptyList()
+        return dir.listFiles().mapNotNull { it.name }.filter { it.startsWith("elamal_") }.sortedDescending()
+    }
+
+    private fun writeToDocumentFile(context: Context, dir: DocumentFile, name: String, content: String): Uri? {
+        dir.findFile(name)?.delete()
+        val doc = dir.createFile("application/json", name) ?: return null
+        context.contentResolver.openOutputStream(doc.uri)?.use {
+            it.write(content.toByteArray(Charsets.UTF_8))
+        }
+        return doc.uri
+    }
+
+    private fun readUriText(context: Context, uri: Uri): String {
+        return context.contentResolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() } ?: ""
+    }
+}
+EOF
+
+# 13. Widget Receiver (Inexact One-Shot Alarm for 60s Confirmation + Forgot Clock-Out Notification + 8s Idempotency)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/widget/ElamalWidgetReceiver.kt
 package com.nanomks.elamal.widget
 
+import android.app.AlarmManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.app.PendingIntent
 import android.appwidget.AppWidgetManager
 import android.appwidget.AppWidgetProvider
@@ -542,6 +1161,7 @@ import android.content.Context
 import android.content.Intent
 import android.graphics.Color
 import android.widget.RemoteViews
+import androidx.core.app.NotificationCompat
 import com.nanomks.elamal.R
 import com.nanomks.elamal.data.ElamalDatabase
 import com.nanomks.elamal.data.EntryType
@@ -561,45 +1181,81 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
 
     override fun onReceive(context: Context, intent: Intent) {
         super.onReceive(context, intent)
-        if (intent.action == "com.nanomks.elamal.ACTION_WIDGET_CLICK") {
-            val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
-            val isEnabled = prefs.getBoolean("widget_enabled", true)
-            if (!isEnabled) return
+        val prefs = context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE)
 
-            val now = System.currentTimeMillis()
-            val lastSave = prefs.getLong("widget_last_save", 0L)
-            if (now - lastSave < 8000L) return // 8-second idempotency protection
-
-            val firstTap = prefs.getLong("widget_first_tap", 0L)
-            if (now - firstTap <= 60_000L) {
-                // Confirmed! Execute Check-in or Check-out
-                prefs.edit().putLong("widget_first_tap", 0L).putLong("widget_last_save", now).apply()
-                val activeStart = prefs.getLong("active_clock_in", 0L)
-                if (activeStart == 0L) {
-                    prefs.edit().putLong("active_clock_in", now).apply()
-                } else {
-                    val rate = prefs.getFloat("hourly_rate", 10f).toDouble()
-                    val pay = ElamalUtils.calculateHourlyPay(activeStart, now, 0, rate)
-                    prefs.edit().putLong("active_clock_in", 0L).apply()
-                    CoroutineScope(Dispatchers.IO).launch {
-                        ElamalDatabase.getInstance(context).dao().insertEntry(
-                            WorkEntry(
-                                type = EntryType.HOURLY,
-                                startTime = activeStart,
-                                endTime = now,
-                                hourlyRateAtEntry = rate,
-                                calculatedAmount = pay,
-                                note = "تسجيل من الودجت"
-                            )
-                        )
-                    }
-                }
-            } else {
-                // First tap: ask for second confirmation tap within 60s
-                prefs.edit().putLong("widget_first_tap", now).apply()
+        when (intent.action) {
+            "com.nanomks.elamal.ACTION_WIDGET_RESET_TAP" -> {
+                refreshAllWidgets(context)
             }
-            refreshAllWidgets(context)
+            "com.nanomks.elamal.ACTION_FORGOT_CLOCK_OUT" -> {
+                val activeStart = prefs.getLong("active_clock_in", 0L)
+                if (activeStart > 0L) {
+                    showForgotClockOutNotification(context)
+                }
+            }
+            "com.nanomks.elamal.ACTION_WIDGET_CLICK" -> {
+                val isEnabled = prefs.getBoolean("widget_enabled", true)
+                if (!isEnabled) return
+
+                val now = System.currentTimeMillis()
+                val lastSave = prefs.getLong("widget_last_save", 0L)
+                if (now - lastSave < 8000L) return // Do not clear/process within 8 seconds of save
+
+                val firstTap = prefs.getLong("widget_first_tap", 0L)
+                if (now - firstTap <= 60_000L) {
+                    prefs.edit().putLong("widget_first_tap", 0L).putLong("widget_last_save", now).apply()
+                    val activeStart = prefs.getLong("active_clock_in", 0L)
+                    if (activeStart == 0L) {
+                        prefs.edit().putLong("active_clock_in", now).apply()
+                        ElamalUtils.scheduleForgotClockOutAlarm(context, now)
+                    } else {
+                        val rate = prefs.getFloat("hourly_rate", 10f).toDouble()
+                        val pay = ElamalUtils.calculateHourlyPay(activeStart, now, 0, rate)
+                        prefs.edit().putLong("active_clock_in", 0L).apply()
+                        ElamalUtils.cancelForgotClockOutAlarm(context)
+                        CoroutineScope(Dispatchers.IO).launch {
+                            ElamalDatabase.getInstance(context).dao().insertEntry(
+                                WorkEntry(
+                                    type = EntryType.HOURLY,
+                                    startTime = activeStart,
+                                    endTime = now,
+                                    hourlyRateAtEntry = rate,
+                                    calculatedAmount = pay,
+                                    note = "تسجيل من الودجت"
+                                )
+                            )
+                        }
+                    }
+                } else {
+                    prefs.edit().putLong("widget_first_tap", now).apply()
+                    // Schedule One-Shot Inexact Alarm after 60s to reset widget UI cleanly
+                    val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                    val resetIntent = Intent(context, ElamalWidgetReceiver::class.java).apply {
+                        action = "com.nanomks.elamal.ACTION_WIDGET_RESET_TAP"
+                    }
+                    val pi = PendingIntent.getBroadcast(
+                        context, 101, resetIntent,
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                    )
+                    am.set(AlarmManager.RTC, now + 61_000L, pi)
+                }
+                refreshAllWidgets(context)
+            }
         }
+    }
+
+    private fun showForgotClockOutNotification(context: Context) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = "elamal_alerts"
+        val channel = NotificationChannel(channelId, "تنبيهات العمل", NotificationManager.IMPORTANCE_HIGH)
+        nm.createNotificationChannel(channel)
+        val notif = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+            .setContentTitle("تنبيه نسيان الخروج - العمل")
+            .setContentText("لديك جلسة عمل جارية تجاوزت الحد المحدد! افتح التطبيق لتسجيل الخروج.")
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .build()
+        nm.notify(901, notif)
     }
 
     companion object {
@@ -624,7 +1280,7 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
                 views.setTextViewText(R.id.widget_status, "معطّل")
             } else if (now - firstTap <= 60_000L) {
                 views.setInt(R.id.widget_root, "setBackgroundColor", Color.parseColor("#D97706"))
-                views.setTextViewText(R.id.widget_status, if (activeStart == 0L) "اضغط مجدداً لتأكيد الدخول" else "اضغط مجدداً لتأكيد الخروج")
+                views.setTextViewText(R.id.widget_status, if (activeStart == 0L) "اضغط مجدداً لتأكيد الدخول (60ث)" else "اضغط مجدداً لتأكيد الخروج (60ث)")
             } else if (activeStart > 0L) {
                 views.setInt(R.id.widget_root, "setBackgroundColor", Color.parseColor("#059669"))
                 views.setTextViewText(R.id.widget_status, "دخول جارٍ.. اضغط للخروج")
@@ -647,7 +1303,7 @@ class ElamalWidgetReceiver : AppWidgetProvider() {
 }
 EOF
 
-# 12. MainActivity (Full RTL Arabic UI: Ledger, Remote, Credit, Settlements, Root Wi-Fi & Settings)
+# 14. MainActivity (Complete App: PIN/Biometric Lock, Onboarding SAF, Home Wi-Fi Card, Historical Settlement Edit, Reports & Monthly Calendar)
 cat << 'EOF' > app/src/main/java/com/nanomks/elamal/MainActivity.kt
 package com.nanomks.elamal
 
@@ -657,11 +1313,13 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
-import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricPrompt
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -678,11 +1336,16 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import com.nanomks.elamal.data.*
+import com.nanomks.elamal.util.BackupSafManager
 import com.nanomks.elamal.util.ElamalUtils
+import com.nanomks.elamal.util.PdfReportGenerator
 import com.nanomks.elamal.widget.ElamalWidgetReceiver
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -691,12 +1354,12 @@ import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.*
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                ElamalApp()
+                ElamalRootScreen(activity = this)
             }
         }
     }
@@ -704,50 +1367,48 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ElamalApp() {
+fun ElamalRootScreen(activity: FragmentActivity) {
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("elamal_prefs", Context.MODE_PRIVATE) }
     val db = remember { ElamalDatabase.getInstance(context) }
     val dao = remember { db.dao() }
     val scope = rememberCoroutineScope()
 
-    var dynamicColor by remember { mutableStateOf(prefs.getBoolean("dynamic_color", true)) }
+    // Appearance & Preferences
+    val sysDark = isSystemInDarkTheme()
+    var themeMode by remember { mutableIntStateOf(prefs.getInt("theme_mode", 0)) } // 0: Auto, 1: Light, 2: Dark
+    val isDark = when (themeMode) {
+        1 -> false
+        2 -> true
+        else -> sysDark
+    }
+    var dynamicColor by remember { mutableStateOf(prefs.getBoolean("dynamic_color", false)) }
+    var appColorHex by remember { mutableStateOf(prefs.getString("app_color_hex", "#10B981") ?: "#10B981") }
     var fontScale by remember { mutableFloatStateOf(prefs.getFloat("font_scale", 1.0f)) }
+
+    // Core Settings
     var hourlyRate by remember { mutableDoubleStateOf(prefs.getFloat("hourly_rate", 10.0f).toDouble()) }
     var activeClockIn by remember { mutableLongStateOf(prefs.getLong("active_clock_in", 0L)) }
     var widgetEnabled by remember { mutableStateOf(prefs.getBoolean("widget_enabled", true)) }
+    var searchFilterEnabled by remember { mutableStateOf(prefs.getBoolean("search_filter_enabled", true)) }
+    var forgotAlarmHours by remember { mutableIntStateOf(prefs.getInt("forgot_alarm_hours", 12)) }
     var workSsids by remember { mutableStateOf(prefs.getString("work_ssids", "Work_WiFi_2.4G,Work_WiFi_5G") ?: "") }
     var backupUriStr by remember { mutableStateOf(prefs.getString("backup_uri", "") ?: "") }
+    var firstRunDone by remember { mutableStateOf(prefs.getBoolean("first_run_done", false)) }
 
-    val entries by dao.getActiveEntries().collectAsState(initial = emptyList())
-    val settlements by dao.getAllSettlements().collectAsState(initial = emptyList())
-    val wifiSessions by dao.getVisibleWifiSessions().collectAsState(initial = emptyList())
+    // Security PIN (4 to 8 digits) + 7 Failed Attempts Delay
+    var savedPin by remember { mutableStateOf(prefs.getString("security_pin", "") ?: "") }
+    var isUnlocked by remember { mutableStateOf(savedPin.isBlank()) }
+    var failedPinAttempts by remember { mutableIntStateOf(prefs.getInt("failed_pin_attempts", 0)) }
+    var lockoutUntil by remember { mutableLongStateOf(prefs.getLong("lockout_until", 0L)) }
 
-    var currentTab by remember { mutableIntStateOf(0) }
-    var searchQuery by remember { mutableStateOf("") }
-    var filterType by remember { mutableStateOf<EntryType?>(null) }
-    var lastDeletedEntry by remember { mutableStateOf<WorkEntry?>(null) }
-
-    // Dialog States
-    var showClockOutDialog by remember { mutableStateOf(false) }
-    var showRemoteDialog by remember { mutableStateOf(false) }
-    var showCreditDialog by remember { mutableStateOf(false) }
-    var showSettleDialog by remember { mutableStateOf(false) }
-
-    // Tick every minute while app is open to update active timer & check Root Wi-Fi
-    var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    var detectedRootSsid by remember { mutableStateOf<String?>(null) }
-
-    LaunchedEffect(Unit) {
-        while (true) {
-            nowMillis = System.currentTimeMillis()
-            activeClockIn = prefs.getLong("active_clock_in", 0L)
-            withContext(Dispatchers.IO) {
-                val ssid = ElamalUtils.getConnectedSsidViaRoot()
-                detectedRootSsid = ssid
-            }
-            delay(60_000L)
+    val primaryCustom = runCatching { Color(android.graphics.Color.parseColor(appColorHex)) }.getOrDefault(Color(0xFF10B981))
+    val colorScheme = when {
+        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
+            if (isDark) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
         }
+        isDark -> darkColorScheme(primary = primaryCustom, secondary = Color(0xFF3B82F6))
+        else -> lightColorScheme(primary = primaryCustom, secondary = Color(0xFF2563EB))
     }
 
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -756,26 +1417,162 @@ fun ElamalApp() {
                 uri,
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
             )
-            prefs.edit().putString("backup_uri", uri.toString()).apply()
+            prefs.edit().putString("backup_uri", uri.toString()).putBoolean("first_run_done", true).apply()
             backupUriStr = uri.toString()
+            firstRunDone = true
         }
     }
 
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> dynamicDarkColorScheme(context)
-        else -> darkColorScheme(primary = Color(0xFF10B981), secondary = Color(0xFF3B82F6))
-    }
-
     MaterialTheme(colorScheme = colorScheme) {
+        // 1. Security PIN Gate (4-8 digits, delay after 7 wrong attempts, Biometric shortcut)
+        if (!isUnlocked) {
+            var pinInput by remember { mutableStateOf("") }
+            var pinError by remember { mutableStateOf("") }
+
+            Surface(modifier = Modifier.fillMaxSize()) {
+                Column(
+                    modifier = Modifier.fillMaxSize().padding(28.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Icon(Icons.Default.Lock, contentDescription = null, modifier = Modifier.size(56.dp), tint = primaryCustom)
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text("قفل تطبيق «العمل»", fontSize = (22 * fontScale).sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    OutlinedTextField(
+                        value = pinInput,
+                        onValueChange = { if (it.length <= 8 && it.all { c -> c.isDigit() }) pinInput = it },
+                        label = { Text("أدخل الرمز (4 إلى 8 أرقام)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true
+                    )
+                    if (pinError.isNotBlank()) {
+                        Text(pinError, color = Color(0xFFEF4444), modifier = Modifier.padding(top = 8.dp))
+                    }
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Button(onClick = {
+                            val now = System.currentTimeMillis()
+                            if (now < lockoutUntil) {
+                                val remSec = (lockoutUntil - now) / 1000L
+                                pinError = "تم تجاوز 7 محاولات! انتظر $remSec ثانية."
+                                return@Button
+                            }
+                            if (pinInput == savedPin) {
+                                failedPinAttempts = 0
+                                prefs.edit().putInt("failed_pin_attempts", 0).apply()
+                                isUnlocked = true
+                            } else {
+                                failedPinAttempts += 1
+                                prefs.edit().putInt("failed_pin_attempts", failedPinAttempts).apply()
+                                if (failedPinAttempts >= 7) {
+                                    lockoutUntil = now + 30_000L
+                                    prefs.edit().putLong("lockout_until", lockoutUntil).apply()
+                                    pinError = "7 محاولات خاطئة! تم قفل المحاولة لمدة 30 ثانية."
+                                } else {
+                                    pinError = "رمز خاطئ ($failedPinAttempts / 7)"
+                                }
+                            }
+                        }) {
+                            Text("فتح التطبيق")
+                        }
+
+                        OutlinedButton(onClick = {
+                            val executor = ContextCompat.getMainExecutor(context)
+                            val prompt = BiometricPrompt(activity, executor, object : BiometricPrompt.AuthenticationCallback() {
+                                override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                                    isUnlocked = true
+                                }
+                            })
+                            val info = BiometricPrompt.PromptInfo.Builder()
+                                .setTitle("فتح تطبيق العمل بالبصمة")
+                                .setSubtitle("استخدم البصمة كاختصار لفتح القفل")
+                                .setNegativeButtonText("إلغاء")
+                                .build()
+                            prompt.authenticate(info)
+                        }) {
+                            Icon(Icons.Default.Fingerprint, contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("البصمة")
+                        }
+                    }
+                }
+            }
+            return@MaterialTheme
+        }
+
+        // 2. First Welcome Onboarding (Select SAF Backup Folder)
+        if (!firstRunDone) {
+            AlertDialog(
+                onDismissRequest = {},
+                title = { Text("مرحباً بك في تطبيق «العمل»") },
+                text = {
+                    Text("لحماية بياناتك وأجورك تلقائياً، يرجى اختيار مجلد لحفظ النسخ الاحتياطية التلقائية (عبر SAF) قبل البدء، أو يمكنك تخطي ذلك للإعدادات لاحقاً.")
+                },
+                confirmButton = {
+                    Button(onClick = { folderPicker.launch(null) }) {
+                        Text("اختيار مجلد النسخ الاحتياطي")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = {
+                        prefs.edit().putBoolean("first_run_done", true).apply()
+                        firstRunDone = true
+                    }) {
+                        Text("تخطي الآن")
+                    }
+                }
+            )
+        }
+
+        val entries by dao.getActiveEntries().collectAsState(initial = emptyList())
+        val allEntries by dao.getAllNonDeletedEntriesFlow().collectAsState(initial = emptyList())
+        val settlements by dao.getAllSettlements().collectAsState(initial = emptyList())
+        val wifiSessions by dao.getVisibleWifiSessions().collectAsState(initial = emptyList())
+        val pendingWifiList = wifiSessions.filter { it.status == "PENDING" }
+
+        var currentTab by remember { mutableIntStateOf(0) }
+        var searchQuery by remember { mutableStateOf("") }
+        var filterType by remember { mutableStateOf<EntryType?>(null) }
+        var lastDeletedEntry by remember { mutableStateOf<WorkEntry?>(null) }
+        var statusBanner by remember { mutableStateOf("") }
+
+        // Dialog States
+        var showClockOutDialog by remember { mutableStateOf(false) }
+        var showRemoteDialog by remember { mutableStateOf(false) }
+        var showCreditDialog by remember { mutableStateOf(false) }
+        var showSettleDialog by remember { mutableStateOf(false) }
+        var editingSettlement by remember { mutableStateOf<Settlement?>(null) }
+        var confirmIgnoreAllWifi by remember { mutableStateOf(false) }
+
+        // Minute ticker while app is open: updates active timer, polls Root Wi-Fi & triggers auto SAF backup
+        var nowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+        var detectedRootSsid by remember { mutableStateOf<String?>(null) }
+
+        LaunchedEffect(Unit) {
+            while (true) {
+                nowMillis = System.currentTimeMillis()
+                activeClockIn = prefs.getLong("active_clock_in", 0L)
+                withContext(Dispatchers.IO) {
+                    detectedRootSsid = ElamalUtils.pollAndMergeRootWifi(context, dao)
+                }
+                delay(60_000L)
+            }
+        }
+
         Scaffold(
             topBar = {
                 TopAppBar(
                     title = {
-                        Text(
-                            text = "العمل",
-                            fontSize = (20 * fontScale).sp,
-                            fontWeight = FontWeight.Bold
-                        )
+                        Column {
+                            Text("العمل", fontSize = (20 * fontScale).sp, fontWeight = FontWeight.Bold)
+                            if (statusBanner.isNotBlank()) {
+                                Text(statusBanner, fontSize = 11.sp, color = primaryCustom)
+                            }
+                        }
                     },
                     actions = {
                         if (lastDeletedEntry != null) {
@@ -809,12 +1606,18 @@ fun ElamalApp() {
                     NavigationBarItem(
                         selected = currentTab == 2,
                         onClick = { currentTab = 2 },
-                        icon = { Icon(Icons.Default.Wifi, contentDescription = null) },
-                        label = { Text("واي فاي الرووت") }
+                        icon = { Icon(Icons.Default.Assessment, contentDescription = null) },
+                        label = { Text("التقارير") }
                     )
                     NavigationBarItem(
                         selected = currentTab == 3,
                         onClick = { currentTab = 3 },
+                        icon = { Icon(Icons.Default.Wifi, contentDescription = null) },
+                        label = { Text("الواي فاي") }
+                    )
+                    NavigationBarItem(
+                        selected = currentTab == 4,
+                        onClick = { currentTab = 4 },
                         icon = { Icon(Icons.Default.Settings, contentDescription = null) },
                         label = { Text("الإعدادات") }
                     )
@@ -829,7 +1632,7 @@ fun ElamalApp() {
             ) {
                 when (currentTab) {
                     0 -> {
-                        // Summary Card
+                        // TAB 0: HOME & LEDGER
                         val lastCarryOver = settlements.firstOrNull()?.nextCarryOver ?: 0.0
                         val activeSum = entries.sumOf { it.calculatedAmount }
                         val totalNet = activeSum + lastCarryOver
@@ -856,9 +1659,33 @@ fun ElamalApp() {
                             }
                         }
 
+                        // Pending Wi-Fi Sessions Card on Home Screen (Updates every minute while app is open)
+                        if (pendingWifiList.isNotEmpty()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            Card(
+                                modifier = Modifier.fillMaxWidth().clickable { currentTab = 3 },
+                                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E3A8A))
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp).fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text("فترات واي فاي بانتظار المراجعة (${pendingWifiList.size})", color = Color.White, fontWeight = FontWeight.Bold)
+                                        val latestW = pendingWifiList.first()
+                                        val mins = (latestW.endTime - latestW.startTime) / 60000L
+                                        Text("آخر شبكة: ${latestW.ssid} (${ElamalUtils.formatDurationArabic(mins)})", color = Color(0xFFBFDBFE), fontSize = 12.sp)
+                                    }
+                                    TextButton(onClick = { currentTab = 3 }) {
+                                        Text("مراجعة", color = Color.White)
+                                    }
+                                }
+                            }
+                        }
+
                         Spacer(modifier = Modifier.height(10.dp))
 
-                        // Action Buttons Row
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -869,6 +1696,7 @@ fun ElamalApp() {
                                         val now = System.currentTimeMillis()
                                         prefs.edit().putLong("active_clock_in", now).apply()
                                         activeClockIn = now
+                                        ElamalUtils.scheduleForgotClockOutAlarm(context, now)
                                         ElamalWidgetReceiver.refreshAllWidgets(context)
                                     } else {
                                         showClockOutDialog = true
@@ -876,7 +1704,7 @@ fun ElamalApp() {
                                 },
                                 modifier = Modifier.weight(1f),
                                 colors = ButtonDefaults.buttonColors(
-                                    containerColor = if (activeClockIn == 0L) Color(0xFF10B981) else Color(0xFFEF4444)
+                                    containerColor = if (activeClockIn == 0L) primaryCustom else Color(0xFFEF4444)
                                 )
                             ) {
                                 val elapsedMin = if (activeClockIn > 0L) (nowMillis - activeClockIn) / 60000L else 0L
@@ -886,54 +1714,33 @@ fun ElamalApp() {
                                 )
                             }
 
-                            OutlinedButton(onClick = { showRemoteDialog = true }) {
-                                Text("عن بعد")
-                            }
-                            OutlinedButton(onClick = { showCreditDialog = true }) {
-                                Text("كريدي (-)")
-                            }
+                            OutlinedButton(onClick = { showRemoteDialog = true }) { Text("عن بعد") }
+                            OutlinedButton(onClick = { showCreditDialog = true }) { Text("كريدي (-)") }
                         }
 
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // Search & Filter
-                        OutlinedTextField(
-                            value = searchQuery,
-                            onValueChange = { searchQuery = it },
-                            label = { Text("بحث في الملاحظات...") },
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true
-                        )
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp)
-                        ) {
-                            FilterChip(
-                                selected = filterType == null,
-                                onClick = { filterType = null },
-                                label = { Text("الكل") }
+                        if (searchFilterEnabled) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            OutlinedTextField(
+                                value = searchQuery,
+                                onValueChange = { searchQuery = it },
+                                label = { Text("بحث في الملاحظات...") },
+                                modifier = Modifier.fillMaxWidth(),
+                                singleLine = true
                             )
-                            FilterChip(
-                                selected = filterType == EntryType.HOURLY,
-                                onClick = { filterType = EntryType.HOURLY },
-                                label = { Text("ساعات") }
-                            )
-                            FilterChip(
-                                selected = filterType == EntryType.REMOTE,
-                                onClick = { filterType = EntryType.REMOTE },
-                                label = { Text("عن بعد") }
-                            )
-                            FilterChip(
-                                selected = filterType == EntryType.CREDIT,
-                                onClick = { filterType = EntryType.CREDIT },
-                                label = { Text("كريدي") }
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                FilterChip(selected = filterType == null, onClick = { filterType = null }, label = { Text("الكل") })
+                                FilterChip(selected = filterType == EntryType.HOURLY, onClick = { filterType = EntryType.HOURLY }, label = { Text("ساعات") })
+                                FilterChip(selected = filterType == EntryType.REMOTE, onClick = { filterType = EntryType.REMOTE }, label = { Text("عن بعد") })
+                                FilterChip(selected = filterType == EntryType.CREDIT, onClick = { filterType = EntryType.CREDIT }, label = { Text("كريدي") })
+                            }
                         }
 
                         val filtered = entries.filter {
-                            (filterType == null || it.type == filterType) &&
-                                    (searchQuery.isBlank() || it.note.contains(searchQuery, ignoreCase = true))
+                            (!searchFilterEnabled || filterType == null || it.type == filterType) &&
+                                    (!searchFilterEnabled || searchQuery.isBlank() || it.note.contains(searchQuery, ignoreCase = true))
                         }
 
                         LazyColumn(
@@ -943,19 +1750,22 @@ fun ElamalApp() {
                             items(filtered, key = { it.id }) { item ->
                                 EntryRowCard(item = item, fontScale = fontScale, onDelete = {
                                     lastDeletedEntry = item
-                                    scope.launch { dao.updateEntry(item.copy(isDeleted = true)) }
+                                    scope.launch {
+                                        dao.updateEntry(item.copy(isDeleted = true))
+                                        statusBanner = BackupSafManager.performSmartBackup(context, dao)
+                                    }
                                 })
                             }
                         }
                     }
 
                     1 -> {
-                        // Settlements & Archive Tab
+                        // TAB 1: SETTLEMENTS & ARCHIVE (With Historical Edit & Cascading Carry-Over)
                         Button(
                             onClick = { showSettleDialog = true },
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            Text("استلام دفعة جديدة وترحيل الباقي")
+                            Text("استلام دفعة جديدة وترحيل الفرق")
                         }
 
                         if (settlements.isNotEmpty()) {
@@ -965,6 +1775,8 @@ fun ElamalApp() {
                                     scope.launch {
                                         dao.detachEntriesFromSettlement(latest.id)
                                         dao.deleteSettlement(latest)
+                                        dao.recalculateSettlementsCascade()
+                                        statusBanner = BackupSafManager.performSmartBackup(context, dao)
                                     }
                                 },
                                 modifier = Modifier.align(Alignment.End)
@@ -977,10 +1789,19 @@ fun ElamalApp() {
                             items(settlements, key = { it.id }) { s ->
                                 Card(modifier = Modifier.fillMaxWidth()) {
                                     Column(modifier = Modifier.padding(12.dp)) {
-                                        val df = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
-                                        Text("تاريخ الدفعة: ${df.format(Date(s.timestamp))}", fontWeight = FontWeight.Bold)
+                                        val df = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US)
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text("تاريخ الدفعة: ${df.format(Date(s.timestamp))}", fontWeight = FontWeight.Bold)
+                                            IconButton(onClick = { editingSettlement = s }) {
+                                                Icon(Icons.Default.Edit, contentDescription = "تعديل الدفعة")
+                                            }
+                                        }
                                         Text("مجموع السجلات: ${s.entriesTotal} DH | مرحّل سابق: ${s.previousCarryOver} DH")
-                                        Text("المبلغ المستلم: ${s.amountPaid} DH", color = Color(0xFF34D399))
+                                        Text("المبلغ المستلم: ${s.amountPaid} DH", color = Color(0xFF34D399), fontWeight = FontWeight.Bold)
                                         Text("الرصيد المرحّل للقادم: ${s.nextCarryOver} DH", color = Color(0xFFFBBF24))
                                         if (s.note.isNotBlank()) Text("ملاحظة: ${s.note}")
                                     }
@@ -990,11 +1811,165 @@ fun ElamalApp() {
                     }
 
                     2 -> {
-                        // Wi-Fi Root Tracker (Up to 6 Networks, No GPS!)
+                        // TAB 2: SUMMARIES, MONTHLY CALENDAR, WHATSAPP, CSV & 6 PDF REPORTS
+                        val lastCarryOver = settlements.firstOrNull()?.nextCarryOver ?: 0.0
+                        val activeSum = entries.sumOf { it.calculatedAmount }
+                        val totalNet = activeSum + lastCarryOver
+
+                        LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                            item {
+                                Text("مشاركة PDF (يتبع وضع التطبيق: ${if (isDark) "داكن" else "فاتح"})", fontWeight = FontWeight.Bold)
+                                val now = System.currentTimeMillis()
+                                val weekAgo = now - 7 * 86400_000L
+                                val monthAgo = now - 30 * 86400_000L
+
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    Button(
+                                        onClick = {
+                                            PdfReportGenerator.generateAndSharePdf(
+                                                context, "تقرير أسبوع",
+                                                allEntries.filter { it.startTime >= weekAgo }, settlements, isDark
+                                            )
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("أسبوع") }
+
+                                    Button(
+                                        onClick = {
+                                            PdfReportGenerator.generateAndSharePdf(
+                                                context, "تقرير شهري",
+                                                allEntries.filter { it.startTime >= monthAgo }, settlements, isDark
+                                            )
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("تقرير شهري") }
+
+                                    Button(
+                                        onClick = {
+                                            PdfReportGenerator.generateAndSharePdf(
+                                                context, "الملخص النشط",
+                                                entries, settlements, isDark
+                                            )
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("الملخص") }
+                                }
+
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    OutlinedButton(
+                                        onClick = {
+                                            val latestS = settlements.firstOrNull()
+                                            val sEntries = if (latestS != null) allEntries.filter { it.settlementId == latestS.id } else entries
+                                            PdfReportGenerator.generateAndSharePdf(context, "تقرير دفعة", sEntries, settlements, isDark)
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("دفعة") }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            PdfReportGenerator.generateAndSharePdf(context, "كل الدفعات", allEntries.filter { it.settlementId != null }, settlements, isDark)
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("كل الدفعات") }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            PdfReportGenerator.generateAndSharePdf(context, "تقرير فترة كاملة", allEntries, settlements, isDark)
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("فترة") }
+                                }
+                            }
+
+                            item {
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = {
+                                            val txt = ElamalUtils.buildWhatsappFormattedText(entries, totalNet, lastCarryOver)
+                                            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                                type = "text/plain"
+                                                putExtra(Intent.EXTRA_TEXT, txt)
+                                            }
+                                            context.startActivity(Intent.createChooser(sendIntent, "مشاركة نص منسق لواتساب"))
+                                        },
+                                        modifier = Modifier.weight(1f),
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
+                                    ) {
+                                        Text("مشاركة لواتساب")
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = { PdfReportGenerator.exportAndShareCsv(context, allEntries) },
+                                        modifier = Modifier.weight(1f)
+                                    ) {
+                                        Text("تصدير CSV")
+                                    }
+                                }
+                            }
+
+                            item {
+                                // Monthly Calendar Summary
+                                val cal = Calendar.getInstance()
+                                val currentMonth = cal.get(Calendar.MONTH)
+                                val currentYear = cal.get(Calendar.YEAR)
+                                val daysInMonth = cal.getActualMaximum(Calendar.DAY_OF_MONTH)
+
+                                Card(modifier = Modifier.fillMaxWidth()) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text("التقويم الشهري (${currentYear}/${currentMonth + 1})", fontWeight = FontWeight.Bold)
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        for (weekRow in 0 until ((daysInMonth + 6) / 7)) {
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                            ) {
+                                                for (col in 1..7) {
+                                                    val dayNum = weekRow * 7 + col
+                                                    if (dayNum <= daysInMonth) {
+                                                        val daySum = allEntries.filter {
+                                                            val c = Calendar.getInstance().apply { timeInMillis = it.startTime }
+                                                            c.get(Calendar.YEAR) == currentYear &&
+                                                                    c.get(Calendar.MONTH) == currentMonth &&
+                                                                    c.get(Calendar.DAY_OF_MONTH) == dayNum
+                                                        }.sumOf { it.calculatedAmount }
+
+                                                        Box(
+                                                            modifier = Modifier
+                                                                .weight(1f)
+                                                                .background(
+                                                                    if (daySum > 0) Color(0xFF065F46)
+                                                                    else if (daySum < 0) Color(0xFF7F1D1D)
+                                                                    else Color(0xFF334155),
+                                                                    RoundedCornerShape(6.dp)
+                                                                )
+                                                                .padding(vertical = 6.dp),
+                                                            contentAlignment = Alignment.Center
+                                                        ) {
+                                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                                Text("$dayNum", fontSize = 11.sp, color = Color.White, fontWeight = FontWeight.Bold)
+                                                                if (daySum != 0.0) {
+                                                                    Text("${daySum.toInt()}", fontSize = 9.sp, color = Color(0xFFA7F3D0))
+                                                                }
+                                                            }
+                                                        }
+                                                    } else {
+                                                        Spacer(modifier = Modifier.weight(1f))
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    3 -> {
+                        // TAB 3: ECONOMICAL ROOT WI-FI TRACKER (Up to 6 Networks, <10m merge, 2.4G/5G merge)
                         Card(modifier = Modifier.fillMaxWidth()) {
                             Column(modifier = Modifier.padding(12.dp)) {
-                                Text("تتبع شبكات العمل بالرووت (بدون GPS)", fontWeight = FontWeight.Bold)
-                                Text("الشبكة المتصلة حالياً عبر الرووت: ${detectedRootSsid ?: "غير متصل / بانتظار صلاحية su"}")
+                                Text("تتبع شبكات العمل بالرووت (حتى 6 شبكات بدون GPS)", fontWeight = FontWeight.Bold)
+                                Text("الشبكة المتصلة حالياً عبر الرووت: ${detectedRootSsid ?: "غير متصل / بانتظار su"}")
                                 Spacer(modifier = Modifier.height(6.dp))
                                 OutlinedTextField(
                                     value = workSsids,
@@ -1002,18 +1977,18 @@ fun ElamalApp() {
                                         workSsids = it
                                         prefs.edit().putString("work_ssids", it).apply()
                                     },
-                                    label = { Text("قائمة شبكات العمل (حتى 6 مفصولة بفاصلة)") },
+                                    label = { Text("شبكات العمل (حتى 6 مفصولة بفاصلة لدعم الترددين)") },
                                     modifier = Modifier.fillMaxWidth()
                                 )
                                 Button(
                                     onClick = {
                                         scope.launch(Dispatchers.IO) {
-                                            val ssid = ElamalUtils.getConnectedSsidViaRoot() ?: "Work_WiFi_5G"
+                                            val ssid = ElamalUtils.pollAndMergeRootWifi(context, dao) ?: "Work_WiFi_5G"
                                             val now = System.currentTimeMillis()
                                             dao.insertWifiSession(
                                                 WifiSession(
                                                     ssid = ssid,
-                                                    startTime = now - 3600_000L,
+                                                    startTime = now - 5400_000L,
                                                     endTime = now
                                                 )
                                             )
@@ -1021,7 +1996,7 @@ fun ElamalApp() {
                                     },
                                     modifier = Modifier.padding(top = 8.dp)
                                 ) {
-                                    Text("فحص الآن / محاكاة فترة واي فاي")
+                                    Text("فحص الاتصال الآن / اقتراح فترة")
                                 }
                             }
                         }
@@ -1032,8 +2007,8 @@ fun ElamalApp() {
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text("فترات واي فاي بانتظار المراجعة", fontWeight = FontWeight.Bold)
-                            TextButton(onClick = { scope.launch { dao.ignoreAllPendingWifi() } }) {
+                            Text("فترات واي فاي المقترحة", fontWeight = FontWeight.Bold)
+                            TextButton(onClick = { confirmIgnoreAllWifi = true }) {
                                 Text("تجاهل الكل")
                             }
                         }
@@ -1049,7 +2024,7 @@ fun ElamalApp() {
                                         Column {
                                             Text("الشبكة: ${ws.ssid}", fontWeight = FontWeight.Bold)
                                             val durMin = (ws.endTime - ws.startTime) / 60000L
-                                            Text("المدة: ${ElamalUtils.formatDurationArabic(durMin)}")
+                                            Text("المدة المقترحة: ${ElamalUtils.formatDurationArabic(durMin)}")
                                         }
                                         if (ws.status == "ADDED") {
                                             Badge(containerColor = Color(0xFF059669)) {
@@ -1085,10 +2060,18 @@ fun ElamalApp() {
                         }
                     }
 
-                    3 -> {
-                        // Settings Tab
+                    4 -> {
+                        // TAB 4: SETTINGS, SECURITY, APPEARANCE & SMART SAF BACKUP
+                        val lastBackupMillis = prefs.getLong("last_backup_time", 0L)
+                        val backupAgeHours = if (lastBackupMillis > 0L) (System.currentTimeMillis() - lastBackupMillis) / 3600_000L else -1L
+                        var backupFilesList by remember { mutableStateOf(BackupSafManager.listAvailableBackups(context)) }
+                        var encEnabled by remember { mutableStateOf(prefs.getBoolean("backup_encrypt_enabled", false)) }
+                        var backupPass by remember { mutableStateOf(prefs.getString("backup_password", "") ?: "") }
+                        var pinSetting by remember { mutableStateOf(savedPin) }
+
                         LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             item {
+                                Text("الحساب والتنبيهات", fontWeight = FontWeight.Bold, color = primaryCustom)
                                 var rateInput by remember { mutableStateOf(hourlyRate.toString()) }
                                 OutlinedTextField(
                                     value = rateInput,
@@ -1099,19 +2082,43 @@ fun ElamalApp() {
                                             prefs.edit().putFloat("hourly_rate", r.toFloat()).apply()
                                         }
                                     },
-                                    label = { Text("سعر الساعة الافتراضي (DH) - لا يغير السجلات القديمة") },
+                                    label = { Text("سعر الساعة الافتراضي (DH)") },
                                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                                     modifier = Modifier.fillMaxWidth()
                                 )
-                            }
 
-                            item {
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text("تنبيه نسيان الخروج: $forgotAlarmHours ساعة (من 0 إلى 48)")
+                                Slider(
+                                    value = forgotAlarmHours.toFloat(),
+                                    onValueChange = {
+                                        forgotAlarmHours = it.toInt()
+                                        prefs.edit().putInt("forgot_alarm_hours", forgotAlarmHours).apply()
+                                    },
+                                    valueRange = 0f..48f
+                                )
+
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    Text("تفعيل الودجت (الدخول الجاري لا يضيع عند الإطفاء)")
+                                    Text("إظهار شريط البحث والفلتر في الدفتر")
+                                    Switch(
+                                        checked = searchFilterEnabled,
+                                        onCheckedChange = {
+                                            searchFilterEnabled = it
+                                            prefs.edit().putBoolean("search_filter_enabled", it).apply()
+                                        }
+                                    )
+                                }
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("تفعيل الودجت (الدخول الجاري لا يضيع)")
                                     Switch(
                                         checked = widgetEnabled,
                                         onCheckedChange = {
@@ -1124,6 +2131,30 @@ fun ElamalApp() {
                             }
 
                             item {
+                                HorizontalDivider()
+                                Text("المظهر والخط والأيقونة", fontWeight = FontWeight.Bold, color = primaryCustom)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    FilterChip(selected = themeMode == 0, onClick = { themeMode = 0; prefs.edit().putInt("theme_mode", 0).apply() }, label = { Text("تلقائي") })
+                                    FilterChip(selected = themeMode == 1, onClick = { themeMode = 1; prefs.edit().putInt("theme_mode", 1).apply() }, label = { Text("فاتح (للـ PDF أيضاً)") })
+                                    FilterChip(selected = themeMode == 2, onClick = { themeMode = 2; prefs.edit().putInt("theme_mode", 2).apply() }, label = { Text("داكن") })
+                                }
+
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 6.dp)) {
+                                    Button(onClick = { appColorHex = "#10B981"; prefs.edit().putString("app_color_hex", "#10B981").apply() }) { Text("أخضر") }
+                                    Button(onClick = { appColorHex = "#3B82F6"; prefs.edit().putString("app_color_hex", "#3B82F6").apply() }) { Text("أزرق") }
+                                    Button(onClick = { appColorHex = "#8B5CF6"; prefs.edit().putString("app_color_hex", "#8B5CF6").apply() }) { Text("بنفسجي") }
+                                }
+
+                                Text("حجم الخط: ${String.format(Locale.US, "%.1fx", fontScale)}")
+                                Slider(
+                                    value = fontScale,
+                                    onValueChange = {
+                                        fontScale = it
+                                        prefs.edit().putFloat("font_scale", it).apply()
+                                    },
+                                    valueRange = 0.85f..1.35f
+                                )
+
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -1138,18 +2169,7 @@ fun ElamalApp() {
                                         }
                                     )
                                 }
-                            }
 
-                            item {
-                                Button(
-                                    onClick = { folderPicker.launch(null) },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Text(if (backupUriStr.isBlank()) "اختيار مجلد النسخ الاحتياطي التلقائي (SAF)" else "تم ربط مجلد النسخ الاحتياطي ✓")
-                                }
-                            }
-
-                            item {
                                 OutlinedButton(
                                     onClick = {
                                         val pm = context.packageManager
@@ -1166,13 +2186,180 @@ fun ElamalApp() {
                                     },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    Text("تبديل أيقونة التطبيق (أخضر / أزرق ملكي)")
+                                    Text("تبديل أيقونة التطبيق (مع دعم الطبقة الأحادية)")
+                                }
+                            }
+
+                            item {
+                                HorizontalDivider()
+                                Text("الأمان والنسخ الاحتياطي الذكي (5 نسخ دوارة)", fontWeight = FontWeight.Bold, color = primaryCustom)
+                                OutlinedTextField(
+                                    value = pinSetting,
+                                    onValueChange = {
+                                        if (it.length <= 8 && it.all { c -> c.isDigit() }) {
+                                            pinSetting = it
+                                            if (it.isEmpty() || it.length >= 4) {
+                                                savedPin = it
+                                                prefs.edit().putString("security_pin", it).apply()
+                                            }
+                                        }
+                                    },
+                                    label = { Text("رمز القفل (4 إلى 8 أرقام - اتركه فارغاً للإلغاء)") },
+                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("تشفير النسخ الاحتياطية بكلمة مرور")
+                                    Switch(
+                                        checked = encEnabled,
+                                        onCheckedChange = {
+                                            encEnabled = it
+                                            prefs.edit().putBoolean("backup_encrypt_enabled", it).apply()
+                                        }
+                                    )
+                                }
+
+                                if (encEnabled) {
+                                    OutlinedTextField(
+                                        value = backupPass,
+                                        onValueChange = {
+                                            backupPass = it
+                                            prefs.edit().putString("backup_password", it).apply()
+                                        },
+                                        label = { Text("كلمة مرور النسخ الاحتياطي") },
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.height(6.dp))
+                                Text(
+                                    if (backupAgeHours >= 0) "عمر آخر نسخة احتياطية: منذ $backupAgeHours ساعة"
+                                    else "تذكير: لم يتم أخذ نسخة احتياطية بعد!"
+                                )
+
+                                Button(
+                                    onClick = { folderPicker.launch(null) },
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Text(if (backupUriStr.isBlank()) "اختيار مجلد النسخ الاحتياطي (SAF)" else "تغيير مجلد النسخ الاحتياطي ✓")
+                                }
+
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(
+                                        onClick = {
+                                            scope.launch {
+                                                statusBanner = BackupSafManager.performSmartBackup(context, dao, isManual = true)
+                                                backupFilesList = BackupSafManager.listAvailableBackups(context)
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("نسخ يدوي الآن") }
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            scope.launch {
+                                                statusBanner = BackupSafManager.restoreFromBackup(context, dao)
+                                                backupFilesList = BackupSafManager.listAvailableBackups(context)
+                                            }
+                                        },
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("استعادة التلقائية") }
+                                }
+
+                                if (backupFilesList.isNotEmpty()) {
+                                    Text("قائمة النسخ المتوفرة في المجلد (${backupFilesList.size}):", fontWeight = FontWeight.Bold)
+                                    for (bf in backupFilesList.take(8)) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Text(bf, fontSize = 12.sp)
+                                            TextButton(onClick = {
+                                                scope.launch {
+                                                    statusBanner = BackupSafManager.restoreFromBackup(context, dao, bf)
+                                                }
+                                            }) { Text("استعادة") }
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+        }
+
+        // Confirm Ignore All Wi-Fi Dialog
+        if (confirmIgnoreAllWifi) {
+            AlertDialog(
+                onDismissRequest = { confirmIgnoreAllWifi = false },
+                title = { Text("تأكيد تجاهل الكل") },
+                text = { Text("هل أنت متأكد من تجاهل جميع فترات الواي فاي المقترحة؟") },
+                confirmButton = {
+                    Button(onClick = {
+                        scope.launch {
+                            dao.ignoreAllPendingWifi()
+                            confirmIgnoreAllWifi = false
+                        }
+                    }) { Text("نعم، تجاهل الكل") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmIgnoreAllWifi = false }) { Text("إلغاء") }
+                }
+            )
+        }
+
+        // Historical Settlement Edit Dialog (With Automatic Cascading Carry-Over)
+        if (editingSettlement != null) {
+            val target = editingSettlement!!
+            var paidInput by remember { mutableStateOf(target.amountPaid.toString()) }
+            var noteInput by remember { mutableStateOf(target.note) }
+            val df = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+            var dateInput by remember { mutableStateOf(df.format(Date(target.timestamp))) }
+
+            AlertDialog(
+                onDismissRequest = { editingSettlement = null },
+                title = { Text("تعديل دفعة قديمة (مع تحديث المرحّل لاحقاً)") },
+                text = {
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = dateInput,
+                            onValueChange = { dateInput = it },
+                            label = { Text("التاريخ (yyyy-MM-dd)") }
+                        )
+                        OutlinedTextField(
+                            value = paidInput,
+                            onValueChange = { paidInput = it },
+                            label = { Text("المبلغ المستلم (DH)") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+                        )
+                        OutlinedTextField(
+                            value = noteInput,
+                            onValueChange = { noteInput = it },
+                            label = { Text("الملاحظة") }
+                        )
+                    }
+                },
+                confirmButton = {
+                    Button(onClick = {
+                        val newPaid = paidInput.toDoubleOrNull() ?: target.amountPaid
+                        val parsedTime = runCatching { df.parse(dateInput)?.time }.getOrNull() ?: target.timestamp
+                        scope.launch {
+                            dao.updateSettlement(target.copy(timestamp = parsedTime, amountPaid = newPaid, note = noteInput))
+                            dao.recalculateSettlementsCascade()
+                            statusBanner = BackupSafManager.performSmartBackup(context, dao)
+                            editingSettlement = null
+                        }
+                    }) { Text("حفظ وإعادة حساب المرحّل") }
+                }
+            )
         }
 
         // Clock-out Dialog with Break Minutes
@@ -1216,7 +2403,9 @@ fun ElamalApp() {
                             )
                             prefs.edit().putLong("active_clock_in", 0L).apply()
                             activeClockIn = 0L
+                            ElamalUtils.cancelForgotClockOutAlarm(context)
                             ElamalWidgetReceiver.refreshAllWidgets(context)
+                            statusBanner = BackupSafManager.performSmartBackup(context, dao)
                             showClockOutDialog = false
                         }
                     }) { Text("حفظ الخروج") }
@@ -1262,6 +2451,7 @@ fun ElamalApp() {
                                         note = noteStr
                                     )
                                 )
+                                statusBanner = BackupSafManager.performSmartBackup(context, dao)
                                 showRemoteDialog = false
                             }
                         }
@@ -1308,6 +2498,7 @@ fun ElamalApp() {
                                         note = noteStr
                                     )
                                 )
+                                statusBanner = BackupSafManager.performSmartBackup(context, dao)
                                 showCreditDialog = false
                             }
                         }
@@ -1360,6 +2551,7 @@ fun ElamalApp() {
                             )
                             dao.attachEntriesToSettlement(sId)
                             dao.recalculateSettlementsCascade()
+                            statusBanner = BackupSafManager.performSmartBackup(context, dao)
                             showSettleDialog = false
                         }
                     }) { Text("تأكيد وترحيل الفرق") }
@@ -1403,7 +2595,7 @@ fun EntryRowCard(item: WorkEntry, fontScale: Float, onDelete: () -> Unit) {
                     }
                 }
                 if (item.note.isNotBlank()) {
-                    Text(item.note, fontSize = (13 * fontScale).sp, color = Color(0xFFCBD5E1))
+                    Text(item.note, fontSize = (13 * fontScale).sp, color = Color(0xFF94A3B8))
                 }
             }
 
@@ -1423,9 +2615,9 @@ fun EntryRowCard(item: WorkEntry, fontScale: Float, onDelete: () -> Unit) {
 }
 EOF
 
-# 13. proguard-rules.pro
+# 15. proguard-rules.pro
 cat << 'EOF' > app/proguard-rules.pro
 -keep class com.nanomks.elamal.** { *; }
 EOF
 
-echo "=== Project Setup Complete ==="
+echo "=== Complete Elamal v2.0.0 Project Setup Finished ==="
